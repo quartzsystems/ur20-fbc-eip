@@ -72,7 +72,8 @@ async fn main() -> ur20_fbc_eip::Result<()> {
         println!("slot {} {}: {:?}", slot.position, slot.module, slot.values);
     }
 
-    // Explicit writes to outputs need this once (refused while a PLC owns the outputs).
+    // Outputs follow writes only with explicit write access; without it the coupler accepts
+    // and ignores them. Kept alive automatically. Refused while a PLC owns the outputs.
     c.enable_explicit_outputs(Duration::from_secs(5)).await?;
     c.set_output(2, 0, ChannelValue::Bit(true)).await?;
     // Several channels in one read-modify-write:

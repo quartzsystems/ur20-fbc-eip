@@ -47,6 +47,14 @@ All notable changes to this workspace are recorded here. The format follows
 
 ### Fixed
 
+- Explicit write access keepalive: a read after a lapse no longer hides it. Any gap of
+  ≥ ¾ of the timeout since access was last asserted makes the next output write re-assert
+  it first. (Found by the hardware write test: the write after the lapse was silently
+  ignored by the coupler.)
+- Docs and the mock coupler assumed output writes without explicit access fail with 0x0F.
+  On hardware they are accepted and ignored, and a lapse switches the module outputs off
+  while the output assembly keeps the old image. `Coupler` now logs a warning when outputs
+  are written without access requested through it.
 - A dropped `Client` (or `Coupler`) now sends UnRegisterSession instead of leaving the
   session to time out on the coupler; `close()` is still the clean way.
 - `verify_station` passed with a module pulled: the coupler keeps the slot and its old bit

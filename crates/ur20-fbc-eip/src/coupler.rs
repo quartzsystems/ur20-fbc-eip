@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use tokio::net::ToSocketAddrs;
 use tokio::time::Instant;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use ur20_fbc_eip_cip::{AttributePath, CipService, Client, Identity};
 
 use crate::diagnosis::{CouplerDiagnosis, GatewayDiagnosis, SlotDiagnosis, StatusWord};
@@ -118,13 +118,24 @@ fn split_header<'a>(what: &str, data: &'a [u8], header_len: usize) -> Result<(&'
 ///
 /// # Explicit write access
 ///
-/// After [`Coupler::enable_explicit_outputs`] the coupler accepts output writes until no
-/// request has arrived for the timeout (seen on hardware: access fell back about 5 s after
-/// the last request with a 5 s timeout). The coupler remembers when it last sent a request and
-/// re-asserts access before an output write if the link has been idle for ¾ of the timeout
-/// or more, so a write after a long pause still works. Long-running loops that do not write
-/// can call [`Coupler::keep_explicit_outputs_alive`] each iteration. Requests sent through
-/// [`Coupler::service_mut`] are not tracked.
+/// The coupler drives the modules from the output assembly only while explicit write access
+/// is active (0x66/1/108 = 1). Seen on hardware (2026-10-14):
+///
+/// * Without access, a write to the output assembly is **accepted but ignored**: no error,
+///   the assembly reads back the new bytes, the module outputs (0x65/n/114) do not change.
+/// * Access lapses when no request arrives for the timeout. The module outputs then **drop
+///   to 0**, while the assembly still reads back the last bytes written.
+/// * Setting 108 again does not re-apply the assembly; outputs change at the next write.
+///
+/// So after [`Coupler::enable_explicit_outputs`] this type remembers when it last talked to
+/// the coupler. If there was ever a gap of ¾ of the timeout or more since access was last
+/// asserted, the next output write first re-asserts it, even if other requests came after
+/// the gap. That write sends the whole assembly, so outputs that went off with the lapse come
+/// back as the assembly says. Loops that may idle without writing can call
+/// [`Coupler::keep_explicit_outputs_alive`]. Requests sent through
+/// [`Coupler::service_mut`] are not tracked. Writing outputs without ever requesting access
+/// through this type logs a warning, since the coupler would ignore them unless another
+/// client holds access.
 #[derive(Debug)]
 pub struct Coupler<S = Client> {
     service: S,
@@ -134,6 +145,10 @@ pub struct Coupler<S = Client> {
     explicit_timeout: Option<Duration>,
     /// When the last request through this coupler got an answer from the device.
     last_request: Option<Instant>,
+    /// A gap of ≥ ¾ timeout happened since access was last asserted: it may have lapsed.
+    access_gap: bool,
+    /// Warned once about writing without requested access.
+    warned_no_access: bool,
 }
 
 impl Coupler<Client> {
@@ -168,6 +183,7 @@ impl Coupler<Client> {
         info!(peer = %self.service.peer_addr(), "reconnected");
         if let Some(timeout) = self.explicit_timeout {
             self.write_explicit_enable(timeout).await?;
+            self.access_gap = false;
         }
         Ok(())
     }
@@ -253,15 +269,28 @@ impl<S: CipService> Coupler<S> {
             station,
             explicit_timeout: None,
             last_request: None,
+            access_gap: false,
+            warned_no_access: false,
         })
     }
 
     /// Note that the device answered (any reply, error status included, is explicit traffic).
     fn track<T>(&mut self, r: ur20_fbc_eip_cip::Result<T>) -> Result<T> {
         if r.is_ok() || r.as_ref().is_err_and(|e| e.cip_status().is_some()) {
+            if self.idle_exceeds_keepalive() {
+                self.access_gap = true;
+            }
             self.last_request = Some(Instant::now());
         }
         Ok(r?)
+    }
+
+    /// Explicit access is being kept alive and the link has been idle for ≥ ¾ of its timeout.
+    fn idle_exceeds_keepalive(&self) -> bool {
+        let Some(timeout) = self.explicit_timeout.filter(|t| !t.is_zero()) else {
+            return false;
+        };
+        self.idle_time().is_none_or(|idle| idle >= timeout * 3 / 4)
     }
 
     /// Get_Attribute_Single, tracked.
@@ -323,6 +352,17 @@ impl<S: CipService> Coupler<S> {
     /// it first if it may have lapsed ([`Coupler::keep_explicit_outputs_alive`]).
     pub async fn write_output_assembly(&mut self, data: &[u8]) -> Result<()> {
         self.keep_explicit_outputs_alive().await?;
+        if self.layout.explicit_write.is_some()
+            && self.explicit_timeout.is_none()
+            && !self.warned_no_access
+        {
+            self.warned_no_access = true;
+            warn!(
+                "writing outputs without explicit write access requested through this \
+                 Coupler; the coupler ignores such writes unless access is active \
+                 (call enable_explicit_outputs)"
+            );
+        }
         self.set(self.layout.output, data).await
     }
 
@@ -409,6 +449,7 @@ impl<S: CipService> Coupler<S> {
         let timeout = Duration::from_secs(u64::from(secs));
         self.write_explicit_enable(timeout).await?;
         self.explicit_timeout = self.layout.explicit_write.map(|_| timeout);
+        self.access_gap = false;
         info!(timeout_s = secs, "explicit output write access enabled");
         Ok(())
     }
@@ -433,22 +474,23 @@ impl<S: CipService> Coupler<S> {
     }
 
     /// Re-assert explicit write access if [`Coupler::enable_explicit_outputs`] was called
-    /// and nothing has been sent for ¾ of its timeout or longer, i.e. the access has lapsed
-    /// or is about to. Returns whether it sent anything. Does nothing with a timeout of 0
-    /// (no lapse) or when access was never requested.
+    /// and it may have lapsed: nothing sent for ¾ of its timeout or longer, now or at any
+    /// point since access was last asserted. Returns whether it sent anything. Does nothing
+    /// with a timeout of 0 (no lapse) or when access was never requested.
     ///
     /// Output writes call this themselves; call it from loops that may sit idle longer
-    /// than the timeout without writing.
+    /// than the timeout without writing. Re-asserting does not switch outputs back on by
+    /// itself (they dropped to 0 with the lapse); the next output write does.
     pub async fn keep_explicit_outputs_alive(&mut self) -> Result<bool> {
         let Some(timeout) = self.explicit_timeout.filter(|t| !t.is_zero()) else {
             return Ok(false);
         };
-        let idle = self.idle_time().unwrap_or(Duration::MAX);
-        if idle < timeout * 3 / 4 {
+        if !self.access_gap && !self.idle_exceeds_keepalive() {
             return Ok(false);
         }
-        debug!(?idle, ?timeout, "re-asserting explicit write access");
+        debug!(idle = ?self.idle_time(), gap = self.access_gap, ?timeout, "re-asserting explicit write access");
         self.write_explicit_enable(timeout).await?;
+        self.access_gap = false;
         Ok(true)
     }
 

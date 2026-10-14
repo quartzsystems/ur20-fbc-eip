@@ -26,6 +26,8 @@ struct MockCoupler {
     log: Vec<(u8, (u8, u8, u8))>,
     /// When the last request arrived, for the explicit-write lapse.
     last: Option<tokio::time::Instant>,
+    /// Output module data per slot: (slot, offset after the 2-byte header, length).
+    outputs: Vec<(u8, usize, usize)>,
 }
 
 /// 0x65/n/116 of a healthy UR20-16DI-P (byte 4 = 0x70) or UR20-16DO-P (0x72), 2026-10-14.
@@ -71,6 +73,7 @@ impl MockCoupler {
     /// when the module has no data in that direction). Past the last slot: status 0x05.
     fn add_slots(&mut self, slots: &[(&str, u32, usize, usize)]) {
         let mut list = Vec::new();
+        let mut offset = 0;
         for (i, (name, id, in_bits, out_bits)) in slots.iter().enumerate() {
             let slot = u8::try_from(i + 1).unwrap();
             let mut s = (name.len() as u16).to_le_bytes().to_vec();
@@ -89,6 +92,10 @@ impl MockCoupler {
             self.attrs
                 .insert((0x65, slot, 116), healthy_diagnosis(*out_bits > 0));
             self.attrs.insert((0x65, slot, 117), vec![0; 4]);
+            if *out_bits > 0 {
+                self.outputs.push((slot, offset, out_bits.div_ceil(8)));
+                offset += out_bits.div_ceil(8);
+            }
             list.extend_from_slice(&id.to_le_bytes());
         }
         list.resize(256, 0);
@@ -98,6 +105,27 @@ impl MockCoupler {
         self.attrs.insert((0x64, 1, 118), vec![0; 8]);
         self.attrs.insert((0x66, 1, 107), vec![0, 0]);
         self.attrs.insert((0x66, 1, 108), vec![0]);
+    }
+
+    /// What the module in `slot` is actually driving (0x65/n/114).
+    fn driven(&self, slot: u8) -> Vec<u8> {
+        self.attrs[&(0x65, slot, 114)].clone()
+    }
+
+    fn access(&self) -> bool {
+        self.attrs.get(&(0x66, 1, 108)).is_some_and(|v| v == &[1])
+    }
+
+    /// Copy the output assembly to the modules (0x65/n/114), or switch them off.
+    fn drive(&mut self, on: bool) {
+        let image = self.attrs.get(&(0x04, 112, 3)).cloned().unwrap_or_default();
+        for (slot, offset, len) in self.outputs.clone() {
+            let bytes = match image.get(2 + offset..2 + offset + len) {
+                Some(b) if on => b.to_vec(),
+                _ => vec![0; len],
+            };
+            self.attrs.insert((0x65, slot, 114), bytes);
+        }
     }
 
     /// TODO-verify-on-hardware: a station of 4DI-P, 4DO-P, 4AI-UI-16, 4AO-UI-16 with invented
@@ -156,7 +184,8 @@ impl CipService for MockCoupler {
         let data = r.rest().to_vec();
         self.log.push((svc, key));
         // Like the hardware: write access falls back to 0 once no request has arrived for
-        // the timeout in 0x66/1/107 (seen after ~5 s with a 5 s timeout, 2026-10-13).
+        // the timeout in 0x66/1/107 (seen after ~5 s with a 5 s timeout, 2026-10-13), and the
+        // module outputs drop to 0 (0x65/n/114, 2026-10-14).
         let now = tokio::time::Instant::now();
         let secs = self
             .attrs
@@ -167,8 +196,9 @@ impl CipService for MockCoupler {
             && self
                 .last
                 .is_some_and(|last| now - last >= Duration::from_secs(u64::from(secs)));
-        if let Some(v) = self.attrs.get_mut(&(0x66, 1, 108)).filter(|_| lapsed) {
-            *v = vec![0];
+        if lapsed && self.access() {
+            self.attrs.insert((0x66, 1, 108), vec![0]);
+            self.drive(false);
         }
         self.last = Some(now);
         Ok(match svc {
@@ -179,9 +209,7 @@ impl CipService for MockCoupler {
                 None => err(svc, 0x14),
             },
             service::SET_ATTRIBUTE_SINGLE => {
-                if key.0 == 0x04 && self.attrs[&(0x66, 1, 108)] != [1] {
-                    err(svc, 0x0F) // privilege violation until write access is enabled
-                } else if let Some(v) = self.attrs.get_mut(&key) {
+                let resp = if let Some(v) = self.attrs.get_mut(&key) {
                     if v.len() != data.len() {
                         err(svc, if data.len() < v.len() { 0x13 } else { 0x15 })
                     } else {
@@ -190,7 +218,14 @@ impl CipService for MockCoupler {
                     }
                 } else {
                     err(svc, 0x16)
+                };
+                // Like the hardware (2026-10-14): an assembly write is always accepted, but
+                // reaches the modules only while write access is active. Setting 108 alone
+                // does not re-apply the assembly.
+                if key == (0x04, 112, 3) && resp.status.is_success() && self.access() {
+                    self.drive(true);
                 }
+                resp
             }
             _ => err(svc, 0x08),
         })
@@ -230,19 +265,12 @@ async fn read_inputs() {
 }
 
 #[tokio::test]
-async fn set_output_requires_write_access_and_preserves_other_channels() {
+async fn writes_without_access_are_ignored_and_other_channels_preserved() {
     let mut c = coupler();
-    let e = c
-        .set_output(2, 0, ChannelValue::Bit(true))
-        .await
-        .unwrap_err();
-    assert_eq!(
-        match &e {
-            Error::Cip(c) => c.cip_status().map(|s| s.general),
-            _ => None,
-        },
-        Some(0x0F)
-    );
+    // accepted, lands in the assembly, but the module does not follow (as on hardware)
+    c.set_output(2, 0, ChannelValue::Bit(true)).await.unwrap();
+    assert_eq!(c.service_mut().attrs[&(0x04, 112, 3)][2], 0b0011);
+    assert_eq!(c.service_mut().driven(2), [0]);
 
     c.enable_explicit_outputs(Duration::from_millis(4500))
         .await
@@ -256,6 +284,8 @@ async fn set_output_requires_write_access_and_preserves_other_channels() {
         c.service_mut().attrs[&(0x04, 112, 3)],
         [0, 0, 0b0011, 0, 0, 0, 0, 0xfe, 0xff, 0, 0]
     );
+    assert_eq!(c.service_mut().driven(2), [0b0011]);
+    assert_eq!(c.service_mut().driven(4)[4..6], [0xfe, 0xff]);
     let out = c.read_outputs().await.unwrap();
     assert_eq!(out.slots[0].values[1], ChannelValue::Bit(true));
     assert_eq!(out.slots[1].values[2], ChannelValue::Int16(-2));
@@ -662,16 +692,52 @@ async fn bench_with_access(timeout: Duration) -> Coupler<MockCoupler> {
 
 #[tokio::test(start_paused = true)]
 async fn mock_models_the_lapse() {
+    // The sequence measured on the bench on 2026-10-14 with raw reads of 108, 112 and 114.
     let mut c = bench_with_access(Duration::from_secs(2)).await;
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    // bypassing the coupler's tracking: the write hits a lapsed access and is refused
-    let r = c
-        .service_mut()
-        .set_attribute_single(AttributePath::new(0x04, 112, 3), &[0, 0, 1, 0])
-        .await
-        .unwrap_err();
-    assert_eq!(r.cip_status().map(|s| s.general), Some(0x0F));
+    c.set_output(2, 8, ChannelValue::Bit(true)).await.unwrap();
+    assert_eq!(c.service_mut().driven(2), [0x00, 0x01]);
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    // lapsed: access off, module outputs off, assembly still shows the old image
     assert!(!c.explicit_outputs_enabled().await.unwrap());
+    assert_eq!(c.service_mut().driven(2), [0, 0]);
+    assert_eq!(c.service_mut().attrs[&(0x04, 112, 3)], [0, 0, 0x00, 0x01]);
+    // bypassing the coupler's tracking: the write is accepted but does nothing
+    c.service_mut()
+        .set_attribute_single(AttributePath::new(0x04, 112, 3), &[0, 0, 0x00, 0x01])
+        .await
+        .unwrap();
+    assert_eq!(c.service_mut().driven(2), [0, 0]);
+    // re-enabling alone does not re-apply the image
+    c.service_mut()
+        .set_attribute_single(AttributePath::new(0x66, 1, 108), &[1])
+        .await
+        .unwrap();
+    assert_eq!(c.service_mut().driven(2), [0, 0]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn read_after_lapse_does_not_hide_it() {
+    // What failed on the bench: a read after the lapse reset the idle clock, so the next
+    // write skipped the re-assert and was silently ignored.
+    let mut c = bench_with_access(Duration::from_secs(2)).await;
+    c.set_output(2, 0, ChannelValue::Bit(true)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(3500)).await;
+    assert!(!c.explicit_outputs_enabled().await.unwrap());
+    let img = c.read_outputs().await.unwrap();
+    let before = c.service_mut().log.len();
+    c.write_outputs(&img).await.unwrap();
+    assert_eq!(
+        access_writes(&mut c, before),
+        2,
+        "re-asserted despite the reads"
+    );
+    assert!(c.explicit_outputs_enabled().await.unwrap());
+    assert_eq!(c.service_mut().driven(2), [0x01, 0x00], "driven again");
+    // and only once: the next write goes straight through
+    let before = c.service_mut().log.len();
+    c.set_output(2, 0, ChannelValue::Bit(false)).await.unwrap();
+    assert_eq!(access_writes(&mut c, before), 0);
+    assert_eq!(c.service_mut().driven(2), [0, 0]);
 }
 
 #[tokio::test(start_paused = true)]
@@ -690,9 +756,11 @@ async fn write_after_idle_reasserts_access() {
     assert_eq!(c.service_mut().attrs[&(0x04, 112, 3)], [0, 0, 0, 0]);
 
     // same for the one-request image path
-    let img = c.read_outputs().await.unwrap();
+    let mut img = c.read_outputs().await.unwrap();
+    img.set(2, 3, ChannelValue::Bit(true)).unwrap();
     tokio::time::sleep(Duration::from_secs(10)).await;
     c.write_outputs(&img).await.unwrap();
+    assert_eq!(c.service_mut().driven(2), [0b1000, 0]);
 }
 
 #[tokio::test(start_paused = true)]
@@ -762,5 +830,7 @@ async fn disable_gives_up_access() {
     assert_eq!(c.explicit_outputs_timeout(), None);
     tokio::time::sleep(Duration::from_secs(10)).await;
     assert!(!c.keep_explicit_outputs_alive().await.unwrap());
-    assert!(c.set_output(2, 0, ChannelValue::Bit(true)).await.is_err());
+    // accepted by the coupler, but not driven
+    c.set_output(2, 0, ChannelValue::Bit(true)).await.unwrap();
+    assert_eq!(c.service_mut().driven(2), [0, 0]);
 }

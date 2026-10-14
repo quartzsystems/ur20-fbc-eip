@@ -123,8 +123,9 @@ Keep fixtures as small as possible, comment byte groups (`// 4AI: 27648, 0, 0, 1
 `#[rustfmt::skip]` on the array so the comments stay aligned. Unit tests of codecs go next to
 the codec. Tests of coupler logic go in `crates/ur20-fbc-eip/tests/coupler_mock.rs`, which
 models the coupler's objects as a `(class, instance, attribute) → bytes` map and answers the
-way the real coupler does (0x05 past the last slot, 0x0F for output writes before explicit
-write access). Transport tests go in `crates/cip/tests/mock_adapter.rs`, which runs an
+way the real coupler does: 0x05 past the last slot; output writes without explicit write
+access accepted but not driven (0x65/n/114 unchanged); outputs off when access lapses.
+Transport tests go in `crates/cip/tests/mock_adapter.rs`, which runs an
 in-process TCP adapter.
 
 ## The `TODO-verify-on-hardware` marker
@@ -155,8 +156,10 @@ On PowerShell use `$env:UR20_EIP_ADDR = "192.168.1.10"`.
 These tests are **read-only**, except those whose name contains `writes_outputs`. Those
 switch real outputs and do nothing unless `UR20_EIP_ALLOW_WRITES=1` is also set, so
 `--ignored` alone never drives an output. Set it only when nothing dangerous is wired to the
-DO module. A PLC holding an Exclusive Owner connection makes them fail with a privilege
-violation (0x0F); that is expected. Any new test that writes outputs must follow the same
+DO module. Check what the module drives with 0x65/n/114, not with the output assembly: the
+coupler accepts writes there without write access and ignores them. With a PLC holding an
+Exclusive Owner connection, `enable_explicit_outputs` is refused (per QSG0028) and the
+write tests fail; that is expected. Any new test that writes outputs must follow the same
 naming and gating.
 
 Run one crate or one test with

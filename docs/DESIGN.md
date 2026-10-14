@@ -85,9 +85,14 @@ The diagnosis bits are documented in `ur20_fbc_eip::diagnosis`.
 The input header is the **coupler status word** (AN0050 §5.3). Hardware confirms 2-byte
 headers on **both** 111 and 112 (each 4 bytes with one 16DI and one 16DO).
 
-Important consequence: **explicit output writes are rejected until 0x66/1/108 is set to 1**,
-and that is refused while a PLC holds an Exclusive Owner connection. `Coupler` exposes this as
-`enable_explicit_outputs(timeout)`.
+Important consequence: **the modules follow the output assembly only while 0x66/1/108 = 1**
+(explicit write access), which per QSG0028 is refused while a PLC holds an Exclusive Owner
+connection. Measured on 2026-10-14 (§7): without access, a write to 112 is *accepted and
+ignored* (no error; 112 reads back the new bytes, the module's 0x65/n/114 does not change).
+When access lapses, the module outputs drop to 0 while 112 keeps the stale image. So 112 shows
+what was last written, and 0x65/n/114 shows what is driven. `Coupler` exposes this as
+`enable_explicit_outputs(timeout)` and re-asserts access before writes when it may have
+lapsed.
 
 Still marked `TODO-verify-on-hardware` in code (and listed in §7):
 * bit order of 16-channel modules (needs a live signal) and byte order of 16-bit analog data;
@@ -133,6 +138,37 @@ encapsulation status, CIP general/extended status, timeouts and malformed-frame 
 path can contain configuration/consumed/produced connection points. `ForwardOpenReply` keeps
 any sockaddr CPF items. `io.rs` defines `RunIdleHeader` and `SequenceCount` types. Phase 3
 adds an `ImplicitConnection` that owns a UDP socket on 2222.
+
+Phase 3 design notes (not started; collected while doing phases 1–2):
+
+* **Forward_Open for "Exclusive Owner Unpacked":** path `20 04 24 01 2C 70 2C 6F`
+  (configuration instance 1, O→T point 112, T→O point 111; §7 item 4). O→T size = 112 length
+  + 4 bytes 32-bit run/idle header; T→O size = 111 length (the 2-byte status word header is
+  part of the assembly, not a CIP header). Input Only / Listen Only use O→T points 0xC6 /
+  0xC7 with no data. Size both from `Station` so a station change fails at Forward_Open
+  (expect general status 0x01 / extended 0x0109 "invalid connection size") rather than
+  later.
+* **Decode with what exists:** each T→O packet is the 111 bytes, so
+  `Coupler::decode_input_assembly` and `encode_output_assembly` work unchanged. The
+  `ImplicitConnection` should hand out raw bytes plus sequence count and let the caller pick
+  the codec layer, which keeps `cip` free of u-remote knowledge.
+* **Explicit and implicit are exclusive for outputs:** while an Exclusive Owner connection
+  is up, `enable_explicit_outputs` is refused and explicit writes to 112 are ignored (as
+  without access). The coupler type should refuse explicit output writes while it owns a
+  class 1 connection and route writes into the next O→T packet instead, rather than
+  relying on the device.
+* **Fail-safe analogy:** with explicit access the outputs drop to 0 on a lapse. Expect the
+  same on a class 1 timeout (RPI × multiplier) or in idle mode (run/idle bit 0). Verify both
+  with 0x65/n/114 and the LED on DO channel 8 before relying on them.
+* **Things to verify on the bench:** whether the web server's "EIPNoConnection" clears with
+  a class 1 connection up (cheap liveness check); whether 0x64/1/104 keeps mirroring the
+  status word; behaviour on module pull with a connection up (the size changes, so the
+  coupler may close the connection).
+* **Runtime shape:** one tokio task per connection that owns the UDP socket and a
+  `tokio::time::interval(rpi)` for O→T, sharing the latest T→O image through a
+  `tokio::sync::watch` channel and taking outputs through a `watch` or `mpsc`. Close with
+  Forward_Close over the existing TCP session. Drop has the same limits as `Client` (§4
+  lifecycle).
 
 ## 5. Public API — `ur20-fbc-eip`
 
@@ -221,12 +257,40 @@ Answered on 2026-10-13 (station: UR20-16DI-P, UR20-16DO-P; all signals off), rea
 6. ✔ Connected (class 3) messaging works; Wireshark dissected all 1,371 captured frames
    without warnings.
 
+Answered with the DI/DO write test and raw probes (2026-10-14, 2 s explicit-write timeout):
+
+* ✔ All output write paths drive the module: `set_outputs` (one write, ch 0 + 15 →
+  112 `00 00 01 80`, 0x65/2/114 `01 80`), `write_slot_outputs` (16 steps, one write each)
+  and `read_outputs` → `OutputImage::set` → `write_outputs`. Each was checked against
+  0x65/2/114, not only the 112 readback.
+* ✔ **Writes without access are accepted and ignored.** With 0x66/1/108 = 0, Set_Attribute
+  on 0x04/112/3 returns success and 112 reads back the new bytes, but 0x65/2/114 stays
+  `00 00`. With access, 114 follows at once. (Contradicts the earlier assumption, taken from
+  the QSG, that such writes are rejected; the mock coupler now models this.)
+* ✔ **Lapse is fail-safe but 112 is stale.** 2 s timeout, DO ch 8 on, 4 s idle: 108 → 0,
+  0x65/2/114 → `00 00`, 112 still `00 00 00 01`. Setting 108 = 1 again does not re-apply
+  112; the next write does. This was seen via 0x65/2/114. The LED on DO channel 8 was not
+  watched for this one.
+* ✔ Access is not tied to the session: enabling it in one TCP session (one `ur20eip raw set`
+  call) and writing from another drove the module.
+* ✔ Keepalive: writes more than the timeout apart (2.5 s with a 2 s timeout) are all
+  driven, because `Coupler` re-asserts 107/108 first. The first run of the write test found
+  a bug here: a read after the lapse reset the idle clock, so the next write skipped the
+  re-assert and was silently ignored. Fixed by remembering any gap of ≥ ¾ timeout until the
+  next re-assert.
+* ✔ Read-only hardware tests (identity unconnected/connected, assemblies and slots,
+  configured station, diagnosis) all pass against the bench station.
+
 Still open:
 
 7. Analog byte order and 2CNT-100 layout: need those modules on the station.
 8. Status word bits other than 6 and 13; the rest of the module diagnosis; 0x64/1/118,
    which no fault has set so far (candidates: a short circuit on a DO, a wire break on a
    DIAG module, a parameter error).
+9. Confirm with the DO channel 8 LED that a write without access, and a lapse, really leave
+   the physical output off (so far seen only via 0x65/2/114).
+10. `Coupler::reconnect` against the real coupler (pull the Ethernet cable during
+    `ur20eip watch --reconnect`); tested only against the mock adapter so far.
 
 Answered with signals on the bench (2026-10-13):
 
