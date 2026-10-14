@@ -2,11 +2,15 @@
 // licensed under the terms of the MIT license which can be found in the
 // root directory of this project.
 
-//! Running light: switch on each DO channel in turn, 0 to 15, and repeat.
+//! Running light: switch on each DO channel in turn, 0 to 15, and repeat. Each step is one
+//! write of the whole DO module ([`Coupler::write_slot_outputs`]), so exactly one channel is
+//! ever on.
+//!
+//! [`Coupler::write_slot_outputs`]: ur20_fbc_eip::Coupler::write_slot_outputs
 //!
 //! Station: slot 2 = UR20-16DO-P (or another 16-channel digital output module). Coupler
-//! address from `UR20_EIP_ADDR`; module list from
-//! `UR20_EIP_MODULES` or, if unset, read from the coupler.
+//! address from `UR20_EIP_ADDR`; module list from `UR20_EIP_MODULES` or, if unset, read
+//! from the coupler.
 //!
 //! ```sh
 //! UR20_EIP_ADDR=192.168.1.10 cargo run -p ur20-fbc-eip --example do_chase
@@ -30,12 +34,10 @@ async fn main() -> Result<()> {
         .enable_explicit_outputs(Duration::from_secs(2))
         .await?;
 
-    let mut previous = 15;
     loop {
         for channel in 0..16 {
-            coupler.set_output(2, previous, Bit(false)).await?;
-            coupler.set_output(2, channel, Bit(true)).await?;
-            previous = channel;
+            let pattern: Vec<_> = (0..16).map(|ch| Bit(ch == channel)).collect();
+            coupler.write_slot_outputs(2, &pattern).await?;
             tokio::time::sleep(STEP).await;
         }
     }

@@ -203,6 +203,81 @@ impl Station {
         slot.module.encode_output_channel(channel, value, bytes)
     }
 
+    /// Change several output channels, given as `(position, channel, value)`, inside the
+    /// output module data. All or nothing: if any change is invalid, `data` is left as it
+    /// was. Later entries for the same channel win.
+    pub fn set_outputs(
+        &self,
+        data: &mut [u8],
+        changes: &[(usize, usize, ChannelValue)],
+    ) -> Result<()> {
+        let mut scratch = data.to_vec();
+        for (position, channel, value) in changes {
+            self.set_output(&mut scratch, *position, *channel, value)?;
+        }
+        data.copy_from_slice(&scratch);
+        Ok(())
+    }
+
+    /// Encode all output channels of the module at `position` into the output module data.
+    pub fn encode_slot_outputs(
+        &self,
+        data: &mut [u8],
+        position: usize,
+        values: &[ChannelValue],
+    ) -> Result<()> {
+        self.check_image("output", data, self.output_len)?;
+        let slot = self.slot(position)?;
+        let len = data.len();
+        let bytes = data
+            .get_mut(slot.outputs.clone())
+            .ok_or_else(|| Error::len("output slot", slot.outputs.end, len))?;
+        slot.module.encode_outputs(values, bytes)
+    }
+
+    /// Encode decoded outputs (as from [`Station::decode_outputs`]) into the output module
+    /// data. Every module with outputs must appear exactly once, under its own name, so a
+    /// stale or foreign image cannot silently switch outputs off. All or nothing.
+    pub fn encode_outputs(&self, slots: &[SlotValues], data: &mut [u8]) -> Result<()> {
+        self.check_image("output", data, self.output_len)?;
+        let mut scratch = data.to_vec();
+        let mut seen = 0;
+        for sv in slots {
+            let slot = self.slot(sv.position)?;
+            if slot.module.name() != sv.module {
+                return Err(Error::StationMismatch {
+                    position: sv.position,
+                    detail: format!(
+                        "output image has {}, station has {}",
+                        sv.module,
+                        slot.module.name()
+                    ),
+                });
+            }
+            self.encode_slot_outputs(&mut scratch, sv.position, &sv.values)?;
+            seen += 1;
+        }
+        let expected = self
+            .slots
+            .iter()
+            .filter(|s| s.module.output_channels() > 0)
+            .count();
+        let mut positions: Vec<_> = slots.iter().map(|s| s.position).collect();
+        positions.sort_unstable();
+        positions.dedup();
+        if seen != expected || positions.len() != expected {
+            return Err(Error::StationMismatch {
+                position: 0,
+                detail: format!(
+                    "output image covers {} slot(s) with outputs, station has {expected}",
+                    positions.len()
+                ),
+            });
+        }
+        data.copy_from_slice(&scratch);
+        Ok(())
+    }
+
     /// Compare configured modules with what the coupler reports: count, module ID (when
     /// reported) and process data size in bits.
     pub fn verify(&self, reported: &[SlotInfo]) -> Result<()> {
@@ -331,6 +406,71 @@ mod tests {
         assert!(s.set_output(&mut out, 0, 0, &Bit(true)).is_err());
         assert!(s.set_output(&mut out, 1, 0, &Bit(true)).is_err()); // DI has no outputs
         assert!(s.set_output(&mut out[..5], 6, 0, &Bit(true)).is_err());
+    }
+
+    #[test]
+    fn set_outputs_is_all_or_nothing() {
+        let s = station();
+        let mut out = [0u8; 10];
+        s.set_outputs(
+            &mut out,
+            &[(2, 3, Bit(true)), (6, 7, Bit(true)), (5, 0, Int16(-1))],
+        )
+        .expect("valid");
+        // -1 so the (unverified) analog byte order does not matter here
+        assert_eq!(out, [0b1000, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0b1000_0000]);
+        s.set_outputs(&mut out, &[(2, 3, Bit(false)), (2, 3, Bit(true))])
+            .expect("last entry wins");
+        assert_eq!(out[0], 0b1000);
+
+        let before = out;
+        assert!(
+            s.set_outputs(&mut out, &[(6, 0, Bit(true)), (6, 8, Bit(true))])
+                .is_err()
+        );
+        assert!(
+            s.set_outputs(&mut out, &[(6, 0, Bit(true)), (2, 0, Int16(1))])
+                .is_err()
+        );
+        assert_eq!(out, before, "untouched on error");
+        s.set_outputs(&mut out, &[]).expect("empty batch");
+        assert_eq!(out, before);
+    }
+
+    #[test]
+    fn encode_whole_slots_and_images() {
+        let s = station();
+        let mut out = [0u8; 10];
+        s.encode_slot_outputs(&mut out, 6, &vec![Bit(true); 8])
+            .expect("valid");
+        assert_eq!(out[9], 0xFF);
+        assert!(
+            s.encode_slot_outputs(&mut out, 6, &vec![Bit(true); 7])
+                .is_err()
+        );
+        assert!(s.encode_slot_outputs(&mut out, 7, &[]).is_err());
+
+        let mut img = s.decode_outputs(&out).expect("valid");
+        img[0].values[1] = Bit(true); // slot 2
+        img[1].values[0] = Int16(-1); // slot 5
+        s.encode_outputs(&img, &mut out).expect("valid");
+        assert_eq!(out[..3], [0b0010, 0xFF, 0xFF]);
+        assert_eq!(s.decode_outputs(&out).expect("valid"), img);
+
+        let before = out;
+        let mut missing = img.clone();
+        missing.pop();
+        assert!(s.encode_outputs(&missing, &mut out).is_err());
+        let mut doubled = img.clone();
+        doubled[2] = doubled[1].clone();
+        assert!(s.encode_outputs(&doubled, &mut out).is_err());
+        let mut foreign = img.clone();
+        foreign[0].module = "UR20-4DO-P-2A";
+        assert!(matches!(
+            s.encode_outputs(&foreign, &mut out),
+            Err(Error::StationMismatch { position: 2, .. })
+        ));
+        assert_eq!(out, before, "untouched on error");
     }
 
     fn info(v: &[(Option<u32>, usize, usize)]) -> Vec<SlotInfo> {

@@ -52,12 +52,48 @@ impl InputImage {
 }
 
 /// Decoded output assembly (what the coupler is currently driving).
+///
+/// Read it with [`Coupler::read_outputs`], change values with [`OutputImage::set`] (or
+/// directly), and write everything back in one request with [`Coupler::write_outputs`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct OutputImage {
-    /// Raw header bytes.
+    /// Raw header bytes, written back unchanged.
     pub header: Vec<u8>,
     /// Decoded module outputs, slot order, modules without outputs omitted.
     pub slots: Vec<SlotValues>,
+    /// Bytes after the configured modules, written back unchanged.
+    pub trailer: Vec<u8>,
+}
+
+impl OutputImage {
+    /// The value of output `channel` of the module in slot `position` (1-based).
+    pub fn value(&self, position: usize, channel: usize) -> Option<&ChannelValue> {
+        self.slots
+            .iter()
+            .find(|s| s.position == position)
+            .and_then(|s| s.values.get(channel))
+    }
+
+    /// Change output `channel` of slot `position` in this image (nothing is sent). The value
+    /// type is checked by the module codec when the image is written.
+    pub fn set(&mut self, position: usize, channel: usize, value: ChannelValue) -> Result<()> {
+        let count = self.slots.len();
+        let slot = self
+            .slots
+            .iter_mut()
+            .find(|s| s.position == position)
+            .ok_or(Error::NoSuchSlot { position, count })?;
+        let module = slot.module;
+        let count = slot.values.len();
+        let v = slot.values.get_mut(channel).ok_or(Error::InvalidChannel {
+            module,
+            direction: "output",
+            channel,
+            count,
+        })?;
+        *v = value;
+        Ok(())
+    }
 }
 
 fn split_header<'a>(what: &str, data: &'a [u8], header_len: usize) -> Result<(&'a [u8], &'a [u8])> {
@@ -242,14 +278,52 @@ impl<S: CipService> Coupler<S> {
         self.decode_input_assembly(&data)
     }
 
-    /// Read and decode the output assembly.
-    pub async fn read_outputs(&mut self) -> Result<OutputImage> {
-        let data = self.read_output_assembly().await?;
-        let (header, modules) = split_header("output", &data, self.layout.output_header_len)?;
+    /// Decode an output assembly read earlier.
+    pub fn decode_output_assembly(&self, data: &[u8]) -> Result<OutputImage> {
+        let (header, modules) = split_header("output", data, self.layout.output_header_len)?;
         Ok(OutputImage {
             header: header.to_vec(),
             slots: self.station.decode_outputs(modules)?,
+            trailer: modules
+                .get(self.station.output_len()..)
+                .unwrap_or_default()
+                .to_vec(),
         })
+    }
+
+    /// Encode an output image into assembly bytes (header, module data, trailer).
+    ///
+    /// Every module with outputs must be in `image`; see [`Station::encode_outputs`].
+    pub fn encode_output_assembly(&self, image: &OutputImage) -> Result<Vec<u8>> {
+        if image.header.len() != self.layout.output_header_len {
+            return Err(Error::len(
+                "output image header",
+                self.layout.output_header_len,
+                image.header.len(),
+            ));
+        }
+        let mut modules = vec![0; self.station.output_len()];
+        self.station.encode_outputs(&image.slots, &mut modules)?;
+        let mut data = image.header.clone();
+        data.extend_from_slice(&modules);
+        data.extend_from_slice(&image.trailer);
+        Ok(data)
+    }
+
+    /// Read and decode the output assembly.
+    pub async fn read_outputs(&mut self) -> Result<OutputImage> {
+        let data = self.read_output_assembly().await?;
+        self.decode_output_assembly(&data)
+    }
+
+    /// Write a whole output image in one request, e.g. one from [`Coupler::read_outputs`]
+    /// after changing some values. Nothing is sent if any value is invalid.
+    ///
+    /// Requires explicit write access, see [`Coupler::enable_explicit_outputs`].
+    pub async fn write_outputs(&mut self, image: &OutputImage) -> Result<()> {
+        let data = self.encode_output_assembly(image)?;
+        debug!(bytes = data.len(), "writing output image");
+        self.write_output_assembly(&data).await
     }
 
     /// Request explicit messaging write access to outputs.
@@ -290,15 +364,54 @@ impl<S: CipService> Coupler<S> {
         channel: usize,
         value: ChannelValue,
     ) -> Result<()> {
+        debug!(position, channel, %value, "set output");
+        self.modify_outputs(|station, modules| {
+            station.set_output(modules, position, channel, &value)
+        })
+        .await
+    }
+
+    /// Set several output channels, given as `(slot, channel, value)`, with one read and one
+    /// write of the output assembly.
+    ///
+    /// All or nothing: if any entry names a missing slot or channel or has the wrong value
+    /// type, nothing is written. Later entries for the same channel win. An empty list sends
+    /// nothing.
+    pub async fn set_outputs(&mut self, changes: &[(usize, usize, ChannelValue)]) -> Result<()> {
+        if changes.is_empty() {
+            return Ok(());
+        }
+        debug!(count = changes.len(), "set outputs");
+        self.modify_outputs(|station, modules| station.set_outputs(modules, changes))
+            .await
+    }
+
+    /// Set every output channel of the module in slot `position` (one value per channel),
+    /// with one read and one write of the output assembly. Other slots keep their values.
+    pub async fn write_slot_outputs(
+        &mut self,
+        position: usize,
+        values: &[ChannelValue],
+    ) -> Result<()> {
+        debug!(position, count = values.len(), "write slot outputs");
+        self.modify_outputs(|station, modules| {
+            station.encode_slot_outputs(modules, position, values)
+        })
+        .await
+    }
+
+    /// Read the output assembly, let `change` edit the module data, write it back.
+    async fn modify_outputs(
+        &mut self,
+        change: impl FnOnce(&Station, &mut [u8]) -> Result<()>,
+    ) -> Result<()> {
         let mut data = self.read_output_assembly().await?;
         let header_len = self.layout.output_header_len;
         if data.len() < header_len {
             return Err(Error::len("output assembly header", header_len, data.len()));
         }
         let (_, modules) = data.split_at_mut(header_len);
-        self.station
-            .set_output(modules, position, channel, &value)?;
-        debug!(position, channel, %value, "writing output assembly");
+        change(&self.station, modules)?;
         self.write_output_assembly(&data).await
     }
 

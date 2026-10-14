@@ -196,31 +196,49 @@ pub async fn watch(coupler: &mut Coupler<Client>, interval: Duration) -> Result<
     }
 }
 
-/// `ur20eip set`
+/// Options for commands that write outputs.
+#[derive(Debug, Args)]
+pub struct WriteArgs {
+    /// Explicit-write timeout written to the coupler before writing.
+    #[arg(long, default_value = "5s", value_parser = parse::duration)]
+    pub write_timeout: Duration,
+
+    /// Do not request explicit write access first (it may already be active).
+    #[arg(long)]
+    pub no_enable: bool,
+}
+
+/// `ur20eip set` and `ur20eip set-many`: parse every value for its channel's type, then one
+/// read-modify-write of the output assembly.
 pub async fn set(
     coupler: &mut Coupler<Client>,
-    slot: usize,
-    channel: usize,
-    value: &str,
-    write_timeout: Duration,
-    enable: bool,
+    changes: &[parse::Assignment],
+    write: &WriteArgs,
 ) -> Result<()> {
-    let module = &coupler.station().slot(slot)?.module;
-    let kind = module.output_kind(channel).with_context(|| {
-        format!(
-            "{} in slot {slot} has {} output channel(s)",
-            module.name(),
-            module.output_channels()
-        )
-    })?;
-    let value = ChannelValue::parse(value, kind)?;
-    if enable {
+    let changes = changes
+        .iter()
+        .map(|a| {
+            let module = &coupler.station().slot(a.slot)?.module;
+            let kind = module.output_kind(a.channel).with_context(|| {
+                format!(
+                    "{} in slot {} has {} output channel(s)",
+                    module.name(),
+                    a.slot,
+                    module.output_channels()
+                )
+            })?;
+            Ok((a.slot, a.channel, ChannelValue::parse(&a.value, kind)?))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if !write.no_enable {
         coupler
-            .enable_explicit_outputs(write_timeout)
+            .enable_explicit_outputs(write.write_timeout)
             .await
             .context("enabling explicit output writes (is a PLC connected?)")?;
     }
-    coupler.set_output(slot, channel, value.clone()).await?;
-    println!("slot {slot} channel {channel} = {value}");
+    coupler.set_outputs(&changes).await?;
+    for (slot, channel, value) in &changes {
+        println!("slot {slot} channel {channel} = {value}");
+    }
     Ok(())
 }

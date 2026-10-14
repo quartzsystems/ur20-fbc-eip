@@ -75,6 +75,12 @@ async fn main() -> ur20_fbc_eip::Result<()> {
     // Explicit writes to outputs need this once (refused while a PLC owns the outputs).
     c.enable_explicit_outputs(Duration::from_secs(5)).await?;
     c.set_output(2, 0, ChannelValue::Bit(true)).await?;
+    // Several channels in one read-modify-write:
+    c.set_outputs(&[(2, 1, ChannelValue::Bit(true)), (2, 2, ChannelValue::Bit(false))]).await?;
+    // Or edit the whole image and write it back in one request:
+    let mut out = c.read_outputs().await?;
+    out.set(2, 3, ChannelValue::Bit(true))?;
+    c.write_outputs(&out).await?;
     Ok(())
 }
 ```
@@ -93,6 +99,7 @@ ur20eip dump-inputs --raw
 ur20eip dump-outputs
 ur20eip watch --interval 100ms
 ur20eip set 2 0 on                 # slot 2, channel 0
+ur20eip set-many 2:0=on 2:1=off    # one read and one write, all or nothing
 ur20eip raw get 0x04 111 3
 ur20eip raw get-all 0x01 1
 ur20eip raw set 0x66 1 108 01

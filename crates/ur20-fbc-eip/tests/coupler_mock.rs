@@ -324,3 +324,150 @@ async fn header_override() {
     assert_eq!(img.status_word, None);
     assert_eq!(img.slots[0].values[0], ChannelValue::Bit(true));
 }
+
+/// Set_Attribute_Single requests to the output assembly since log entry `from`.
+fn assembly_writes(c: &mut Coupler<MockCoupler>, from: usize) -> usize {
+    c.service_mut().log[from..]
+        .iter()
+        .filter(|(svc, key)| *svc == service::SET_ATTRIBUTE_SINGLE && *key == (0x04, 112, 3))
+        .count()
+}
+
+#[tokio::test]
+async fn set_outputs_is_one_write() {
+    let mut c = coupler();
+    c.enable_explicit_outputs(Duration::from_secs(2))
+        .await
+        .unwrap();
+    let before = c.service_mut().log.len();
+    c.set_outputs(&[
+        (2, 0, ChannelValue::Bit(true)),
+        (2, 3, ChannelValue::Bit(true)),
+        (2, 1, ChannelValue::Bit(false)), // was on
+        (4, 3, ChannelValue::Int16(-1)),
+    ])
+    .await
+    .unwrap();
+    assert_eq!(assembly_writes(&mut c, before), 1);
+    assert_eq!(c.service_mut().log.len() - before, 2, "one read, one write");
+    assert_eq!(
+        c.service_mut().attrs[&(0x04, 112, 3)],
+        [0, 0, 0b1001, 0, 0, 0, 0, 0, 0, 0xff, 0xff]
+    );
+
+    // all or nothing: one bad entry and nothing is written
+    let before = c.service_mut().log.len();
+    let image = c.service_mut().attrs[&(0x04, 112, 3)].clone();
+    for bad in [
+        vec![
+            (2, 0, ChannelValue::Bit(false)),
+            (2, 4, ChannelValue::Bit(true)),
+        ],
+        vec![
+            (2, 0, ChannelValue::Bit(false)),
+            (9, 0, ChannelValue::Bit(true)),
+        ],
+        vec![
+            (2, 0, ChannelValue::Bit(false)),
+            (1, 0, ChannelValue::Bit(true)),
+        ],
+        vec![
+            (2, 0, ChannelValue::Bit(false)),
+            (4, 0, ChannelValue::Bit(true)),
+        ],
+    ] {
+        assert!(c.set_outputs(&bad).await.is_err(), "{bad:?}");
+    }
+    assert_eq!(assembly_writes(&mut c, before), 0);
+    assert_eq!(c.service_mut().attrs[&(0x04, 112, 3)], image);
+
+    // empty batch: no traffic at all
+    let before = c.service_mut().log.len();
+    c.set_outputs(&[]).await.unwrap();
+    assert_eq!(c.service_mut().log.len(), before);
+}
+
+#[tokio::test]
+async fn write_slot_outputs_replaces_one_slot() {
+    let mut c = Coupler::detect(MockCoupler::bench(), CouplerLayout::default())
+        .await
+        .unwrap();
+    c.enable_explicit_outputs(Duration::from_secs(2))
+        .await
+        .unwrap();
+    let mut values = vec![ChannelValue::Bit(false); 16];
+    values[8] = ChannelValue::Bit(true);
+    let before = c.service_mut().log.len();
+    c.write_slot_outputs(2, &values).await.unwrap();
+    assert_eq!(assembly_writes(&mut c, before), 1);
+    // hardware-confirmed (2026-10-13): DO channel 8 = module bytes 00 01
+    assert_eq!(c.service_mut().attrs[&(0x04, 112, 3)], [0, 0, 0x00, 0x01]);
+
+    let before = c.service_mut().log.len();
+    assert!(c.write_slot_outputs(2, &values[..15]).await.is_err());
+    assert!(c.write_slot_outputs(1, &values).await.is_err()); // 16DI has no outputs
+    assert_eq!(assembly_writes(&mut c, before), 0);
+}
+
+#[tokio::test]
+async fn output_image_round_trip() {
+    let mut c = coupler();
+    c.enable_explicit_outputs(Duration::from_secs(2))
+        .await
+        .unwrap();
+    // a header byte the coupler set, which must survive the round trip
+    c.service_mut().attrs.get_mut(&(0x04, 112, 3)).unwrap()[1] = 0x80;
+
+    let mut img = c.read_outputs().await.unwrap();
+    assert_eq!(img.header, [0, 0x80]);
+    assert!(img.trailer.is_empty());
+    assert_eq!(img.value(2, 1), Some(&ChannelValue::Bit(true)));
+    img.set(2, 1, ChannelValue::Bit(false)).unwrap();
+    img.set(2, 2, ChannelValue::Bit(true)).unwrap();
+    img.set(4, 0, ChannelValue::Int16(-1)).unwrap();
+    assert!(matches!(
+        img.set(1, 0, ChannelValue::Bit(true)),
+        Err(Error::NoSuchSlot { .. })
+    ));
+    assert!(matches!(
+        img.set(2, 4, ChannelValue::Bit(true)),
+        Err(Error::InvalidChannel { .. })
+    ));
+
+    let before = c.service_mut().log.len();
+    c.write_outputs(&img).await.unwrap();
+    assert_eq!(c.service_mut().log.len() - before, 1, "one write, no read");
+    assert_eq!(
+        c.service_mut().attrs[&(0x04, 112, 3)],
+        [0, 0x80, 0b0100, 0xff, 0xff, 0, 0, 0, 0, 0, 0]
+    );
+    assert_eq!(c.read_outputs().await.unwrap(), img);
+
+    // a wrong type is caught by the codec before anything is sent
+    let mut bad = img.clone();
+    bad.set(2, 0, ChannelValue::Int16(1)).unwrap();
+    let mut partial = img.clone();
+    partial.slots.pop();
+    let mut short_header = img.clone();
+    short_header.header.pop();
+    let before = c.service_mut().log.len();
+    for image in [bad, partial, short_header] {
+        assert!(c.write_outputs(&image).await.is_err());
+    }
+    assert_eq!(c.service_mut().log.len(), before);
+}
+
+#[tokio::test]
+async fn output_trailer_is_written_back() {
+    let mut mock = MockCoupler::bench();
+    mock.attrs.insert((0x04, 112, 3), vec![0, 0, 0, 0, 7, 7]);
+    mock.attrs.insert((0x66, 1, 108), vec![1]);
+    let mut c = Coupler::detect(mock, CouplerLayout::default())
+        .await
+        .unwrap();
+    let mut img = c.read_outputs().await.unwrap();
+    assert_eq!(img.trailer, [7, 7]);
+    img.set(2, 0, ChannelValue::Bit(true)).unwrap();
+    c.write_outputs(&img).await.unwrap();
+    assert_eq!(c.service_mut().attrs[&(0x04, 112, 3)], [0, 0, 1, 0, 7, 7]);
+}

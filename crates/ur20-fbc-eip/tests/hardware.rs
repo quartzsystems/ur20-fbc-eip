@@ -70,3 +70,89 @@ async fn configured_station_matches_hardware() {
     let img = c.read_inputs().await.unwrap();
     println!("{img:#?}");
 }
+
+/// Switches real outputs. Needs `UR20_EIP_ALLOW_WRITES=1` as well as `--ignored`, a digital
+/// output module somewhere on the station, and no PLC owning the outputs. Uses a 2 s
+/// explicit-write timeout and restores the original outputs before it checks the lapse.
+#[tokio::test]
+#[ignore = "needs hardware and UR20_EIP_ALLOW_WRITES=1: switches outputs"]
+async fn digital_writes_outputs() {
+    use std::time::Duration;
+    use ur20_fbc_eip::{Category, ChannelValue::Bit};
+
+    if std::env::var("UR20_EIP_ALLOW_WRITES").as_deref() != Ok("1") {
+        println!("skipped: set UR20_EIP_ALLOW_WRITES=1 to switch real outputs");
+        return;
+    }
+    let timeout = Duration::from_secs(2);
+    let mut c = Coupler::connect_auto(addr(), CouplerLayout::default())
+        .await
+        .unwrap();
+    let (slot, channels) = c
+        .station()
+        .slots()
+        .iter()
+        .find(|s| s.module.descriptor().category == Category::DigitalOutput)
+        .map(|s| (s.position, s.module.output_channels()))
+        .expect("a digital output module on the station");
+    println!("DO module in slot {slot}, {channels} channels");
+    c.enable_explicit_outputs(timeout).await.unwrap();
+    assert!(c.explicit_outputs_enabled().await.unwrap());
+    let saved = c.read_outputs().await.unwrap();
+
+    // batch: first and last channel on, everything else off, in one write
+    let mut changes: Vec<_> = (0..channels).map(|ch| (slot, ch, Bit(false))).collect();
+    changes.push((slot, 0, Bit(true)));
+    changes.push((slot, channels - 1, Bit(true)));
+    c.set_outputs(&changes).await.unwrap();
+    let img = c.read_outputs().await.unwrap();
+    for ch in 0..channels {
+        let on = ch == 0 || ch == channels - 1;
+        assert_eq!(img.value(slot, ch), Some(&Bit(on)), "channel {ch}");
+    }
+    println!(
+        "set_outputs: {}",
+        hex(&c.read_output_assembly().await.unwrap())
+    );
+
+    // whole slot, one write per step
+    for ch in 0..channels {
+        let pattern: Vec<_> = (0..channels).map(|n| Bit(n == ch)).collect();
+        c.write_slot_outputs(slot, &pattern).await.unwrap();
+        let img = c.read_outputs().await.unwrap();
+        assert_eq!(
+            img.slots
+                .iter()
+                .find(|s| s.position == slot)
+                .unwrap()
+                .values,
+            pattern
+        );
+    }
+
+    // image path: read, modify, write
+    let mut img = c.read_outputs().await.unwrap();
+    img.set(slot, 0, Bit(true)).unwrap();
+    c.write_outputs(&img).await.unwrap();
+    assert_eq!(c.read_outputs().await.unwrap(), img);
+
+    c.write_outputs(&saved).await.unwrap();
+    assert_eq!(c.read_outputs().await.unwrap(), saved);
+
+    // leave one channel on, go quiet for longer than the timeout, see what lapses
+    c.set_output(slot, 0, Bit(true)).await.unwrap();
+    tokio::time::sleep(timeout + Duration::from_millis(1500)).await;
+    let enabled = c.explicit_outputs_enabled().await.unwrap();
+    let after = c.read_output_assembly().await.unwrap();
+    println!(
+        "after {timeout:?} + 1.5 s idle: 0x66/1/108 = {enabled}, assembly 112 = {}",
+        hex(&after)
+    );
+    // tidy up whatever the lapse did
+    c.enable_explicit_outputs(timeout).await.unwrap();
+    c.write_outputs(&saved).await.unwrap();
+    assert!(
+        !enabled,
+        "explicit write access should lapse after {timeout:?} without traffic"
+    );
+}

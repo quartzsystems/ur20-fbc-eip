@@ -142,6 +142,11 @@ let mut cpl = Coupler::connect(addr, layout, modules).await?;
 let img = cpl.read_inputs().await?;              // InputImage { status_word, slots: [...] }
 cpl.enable_explicit_outputs(Duration::from_secs(5)).await?;
 cpl.set_output(slot, channel, ChannelValue::Bit(true)).await?;   // read-modify-write of 112
+cpl.set_outputs(&[(2, 0, Bit(true)), (2, 1, Bit(false))]).await?; // one read + one write, all or nothing
+cpl.write_slot_outputs(2, &values).await?;       // every channel of one module, one write
+let mut out = cpl.read_outputs().await?;         // OutputImage { header, slots, trailer }
+out.set(2, 3, Bit(true))?;                       // edit locally, nothing sent
+cpl.write_outputs(&out).await?;                  // one write, no read; header/trailer kept
 let slots = cpl.discover_slots().await?;         // class 0x65 → SlotInfo { id, name, bits }
 cpl.verify_station().await?;                     // ID or size mismatch → Err
 ```
@@ -162,6 +167,8 @@ ur20eip [--addr IP[:PORT] | $UR20_EIP_ADDR] [--timeout-ms N] [--connected]
   watch        --modules … --interval 250ms  print changed input channels
   set <slot> <channel> <value> --modules … [--write-timeout 5s] [--no-enable]
                                              read-modify-write one output channel
+  set-many <slot:ch=value>… --modules … [--write-timeout 5s] [--no-enable]
+                                             several channels, one read + one write
   raw get     <class> <instance> <attr>
   raw get-all <class> <instance>
   raw set     <class> <instance> <attr> <hex-bytes>

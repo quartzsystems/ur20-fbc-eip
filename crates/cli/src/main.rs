@@ -75,12 +75,20 @@ enum Command {
         value: String,
         #[command(flatten)]
         station: station::StationArgs,
-        /// Explicit-write timeout written to the coupler before writing.
-        #[arg(long, default_value = "5s", value_parser = parse::duration)]
-        write_timeout: Duration,
-        /// Do not request explicit write access first (it may already be active).
-        #[arg(long)]
-        no_enable: bool,
+        #[command(flatten)]
+        write: station::WriteArgs,
+    },
+    /// Set several output channels with one read and one write of the output assembly.
+    ///
+    /// All or nothing: if any value is invalid, nothing is written.
+    SetMany {
+        /// Changes as slot:channel=value, e.g. 2:0=on 2:1=off 3:0=13824.
+        #[arg(required = true, value_parser = parse::assignment)]
+        outputs: Vec<parse::Assignment>,
+        #[command(flatten)]
+        station: station::StationArgs,
+        #[command(flatten)]
+        write: station::WriteArgs,
     },
     /// Arbitrary class/instance/attribute access.
     #[command(subcommand)]
@@ -93,7 +101,8 @@ impl Cli {
             Command::DumpInputs { station, .. }
             | Command::DumpOutputs { station }
             | Command::Watch { station, .. }
-            | Command::Set { station, .. } => Some(station),
+            | Command::Set { station, .. }
+            | Command::SetMany { station, .. } => Some(station),
             _ => None,
         }
     }
@@ -156,19 +165,25 @@ async fn main() -> Result<()> {
             channel,
             value,
             station,
-            write_timeout,
-            no_enable,
+            write,
+        } => {
+            let one = parse::Assignment {
+                slot: *slot,
+                channel: *channel,
+                value: value.clone(),
+            };
+            let mut coupler = station.coupler(client).await?;
+            let r = station::set(&mut coupler, &[one], write).await;
+            client = coupler.into_inner();
+            r
+        }
+        Command::SetMany {
+            outputs,
+            station,
+            write,
         } => {
             let mut coupler = station.coupler(client).await?;
-            let r = station::set(
-                &mut coupler,
-                *slot,
-                *channel,
-                value,
-                *write_timeout,
-                !*no_enable,
-            )
-            .await;
+            let r = station::set(&mut coupler, outputs, write).await;
             client = coupler.into_inner();
             r
         }
@@ -228,6 +243,7 @@ mod tests {
             &["dump-outputs", "-m", "UR20-16DI-P,UR20-16DO-P"],
             &["watch", "-i", "100ms"],
             &["set", "2", "8", "on", "--write-timeout", "5s"],
+            &["set-many", "2:0=on", "2:15=off", "--no-enable"],
             &["raw", "get", "0x04", "111", "3"],
             &["raw", "get-all", "1", "1"],
             &["raw", "scan", "0x64", "1", "100", "120"],
@@ -283,6 +299,29 @@ mod tests {
             .filter(|w| w.starts_with("UR20_EIP_"));
         for var in mentioned {
             assert!(known.iter().any(|k| k == var), "README mentions {var}");
+        }
+    }
+
+    #[test]
+    fn set_many_needs_at_least_one_change() {
+        assert!(Cli::try_parse_from(["ur20eip", "set-many"]).is_err());
+        assert!(Cli::try_parse_from(["ur20eip", "set-many", "2:0"]).is_err());
+        let cli = parse(&[
+            "set-many",
+            "2:0=on",
+            "-m",
+            "UR20-16DI-P,UR20-16DO-P",
+            "2:1=1",
+        ]);
+        match cli.command {
+            Command::SetMany {
+                outputs, station, ..
+            } => {
+                assert_eq!(outputs.len(), 2);
+                assert_eq!(outputs.get(1).map(|a| a.channel), Some(1));
+                assert_eq!(station.modules.len(), 2);
+            }
+            other => panic!("{other:?}"),
         }
     }
 

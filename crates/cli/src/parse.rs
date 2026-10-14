@@ -50,6 +50,34 @@ pub fn hex_arg(s: &str) -> Result<HexBytes, String> {
     hex_bytes(s).map(HexBytes)
 }
 
+/// One output change: `slot:channel=value`, e.g. `2:8=on`. The value is parsed later, once
+/// the module (and so the channel type) is known.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Assignment {
+    /// Slot, 1-based.
+    pub slot: usize,
+    /// Channel, from 0.
+    pub channel: usize,
+    /// Value text.
+    pub value: String,
+}
+
+/// `slot:channel=value`.
+pub fn assignment(s: &str) -> Result<Assignment, String> {
+    let bad = || format!("`{s}`: expected slot:channel=value, e.g. 2:8=on");
+    let (target, value) = s.split_once('=').ok_or_else(bad)?;
+    let (slot, channel) = target.split_once(':').ok_or_else(bad)?;
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(bad());
+    }
+    Ok(Assignment {
+        slot: int(slot.trim()).map_err(|_| bad())?,
+        channel: int(channel.trim()).map_err(|_| bad())?,
+        value: value.to_owned(),
+    })
+}
+
 /// Hex bytes: `01 02 ff`, `0102ff`, `01,02,ff` or `0x0102ff`.
 pub fn hex_bytes(s: &str) -> Result<Vec<u8>, String> {
     let cleaned: String = s
@@ -101,6 +129,29 @@ mod tests {
         assert_eq!(duration("100"), Ok(Duration::from_millis(100)));
         assert!(duration("-1s").is_err());
         assert!(duration("fast").is_err());
+    }
+
+    #[test]
+    fn assignments() {
+        assert_eq!(
+            assignment("2:8=on"),
+            Ok(Assignment {
+                slot: 2,
+                channel: 8,
+                value: "on".into()
+            })
+        );
+        assert_eq!(
+            assignment("4:0=-27648").map(|a| a.value),
+            Ok("-27648".into())
+        );
+        assert_eq!(
+            assignment("0x2:0x0f=1").map(|a| (a.slot, a.channel)),
+            Ok((2, 15))
+        );
+        for bad in ["2:8", "2=on", "2:8=", "a:8=on", "2:-1=on", ""] {
+            assert!(assignment(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

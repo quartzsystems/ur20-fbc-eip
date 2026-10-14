@@ -152,9 +152,12 @@ cargo test --workspace -- --ignored --nocapture
 
 On PowerShell use `$env:UR20_EIP_ADDR = "192.168.1.10"`.
 
-These tests are **read-only**. Any hardware test that switches outputs must say so in its
-name and be gated behind an extra environment variable, so `--ignored` alone never drives a
-real output.
+These tests are **read-only**, except those whose name contains `writes_outputs`. Those
+switch real outputs and do nothing unless `UR20_EIP_ALLOW_WRITES=1` is also set, so
+`--ignored` alone never drives an output. Set it only when nothing dangerous is wired to the
+DO module. A PLC holding an Exclusive Owner connection makes them fail with a privilege
+violation (0x0F); that is expected. Any new test that writes outputs must follow the same
+naming and gating.
 
 Run one crate or one test with
 `cargo test -p ur20-fbc-eip --test hardware -- --ignored --nocapture <name>`. Set
