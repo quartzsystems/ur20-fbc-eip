@@ -195,3 +195,72 @@ async fn identity(client: &mut Client) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::panic)]
+
+    use clap::{CommandFactory, Parser};
+
+    use super::*;
+    use crate::parse::HexBytes;
+
+    fn parse(args: &[&str]) -> Cli {
+        let mut argv = vec!["ur20eip", "--addr", "10.0.0.1"];
+        argv.extend_from_slice(args);
+        match Cli::try_parse_from(argv) {
+            Ok(cli) => cli,
+            Err(e) => panic!("{args:?}: {e}"),
+        }
+    }
+
+    #[test]
+    fn definition_is_consistent() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn every_command_parses() {
+        for args in [
+            &["identity"][..],
+            &["slots"],
+            &["dump-inputs", "--raw"],
+            &["dump-outputs", "-m", "UR20-16DI-P,UR20-16DO-P"],
+            &["watch", "-i", "100ms"],
+            &["set", "2", "8", "on", "--write-timeout", "5s"],
+            &["raw", "get", "0x04", "111", "3"],
+            &["raw", "get-all", "1", "1"],
+            &["raw", "scan", "0x64", "1", "100", "120"],
+        ] {
+            parse(args);
+        }
+    }
+
+    #[test]
+    fn raw_set_takes_one_hex_argument() {
+        let cli = parse(&["raw", "set", "0x66", "1", "107", "05 00"]);
+        match cli.command {
+            Command::Raw(raw::RawCommand::Set { value, .. }) => {
+                assert_eq!(value, HexBytes(vec![0x05, 0x00]));
+            }
+            other => panic!("{other:?}"),
+        }
+        let cli = parse(&[
+            "raw",
+            "service",
+            "0x0e",
+            "1",
+            "1",
+            "--attribute",
+            "7",
+            "--data",
+            "0102",
+        ]);
+        match cli.command {
+            Command::Raw(raw::RawCommand::Service { data, .. }) => {
+                assert_eq!(data, Some(HexBytes(vec![1, 2])));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+}

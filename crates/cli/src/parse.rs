@@ -40,7 +40,17 @@ pub fn duration(s: &str) -> Result<Duration, String> {
     Duration::try_from_secs_f64(v * scale).map_err(|_| bad())
 }
 
-/// Hex bytes:`01 02 ff`, `0102ff`, `01,02,ff` or `0x0102ff`.
+/// Bytes given as one hex argument. A newtype, because clap reads a plain `Vec<u8>` field
+/// as a list of separate `u8` arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HexBytes(pub Vec<u8>);
+
+/// [`hex_bytes`] wrapped in [`HexBytes`], for use as a clap value parser.
+pub fn hex_arg(s: &str) -> Result<HexBytes, String> {
+    hex_bytes(s).map(HexBytes)
+}
+
+/// Hex bytes: `01 02 ff`, `0102ff`, `01,02,ff` or `0x0102ff`.
 pub fn hex_bytes(s: &str) -> Result<Vec<u8>, String> {
     let cleaned: String = s
         .trim_start_matches("0x")

@@ -47,8 +47,8 @@ pub enum RawCommand {
         #[arg(value_parser = parse::int::<u16>)]
         attribute: u16,
         /// Value as hex bytes in wire order, e.g. "01" or "05 00".
-        #[arg(value_parser = parse::hex_bytes)]
-        value: Vec<u8>,
+        #[arg(value_parser = parse::hex_arg)]
+        value: parse::HexBytes,
     },
     /// Any service code against class/instance[/attribute] with optional request data.
     Service {
@@ -65,8 +65,8 @@ pub enum RawCommand {
         #[arg(long, value_parser = parse::int::<u16>)]
         attribute: Option<u16>,
         /// Request data as hex bytes.
-        #[arg(long, value_parser = parse::hex_bytes)]
-        data: Option<Vec<u8>>,
+        #[arg(long, value_parser = parse::hex_arg)]
+        data: Option<parse::HexBytes>,
     },
     /// Get_Attribute_Single over a range of attributes, skipping unsupported ones.
     Scan {
@@ -127,7 +127,7 @@ pub async fn run(client: &mut Client, cmd: &RawCommand) -> Result<()> {
             ref value,
         } => {
             client
-                .set_attribute_single(AttributePath::new(class, instance, attribute), value)
+                .set_attribute_single(AttributePath::new(class, instance, attribute), &value.0)
                 .await?;
             println!("ok");
         }
@@ -142,7 +142,8 @@ pub async fn run(client: &mut Client, cmd: &RawCommand) -> Result<()> {
             if let Some(a) = attribute {
                 path = path.with(Segment::Attribute(a));
             }
-            let request = MessageRequest::new(service, path, data.clone().unwrap_or_default());
+            let request =
+                MessageRequest::new(service, path, data.clone().map(|d| d.0).unwrap_or_default());
             let response = client.send(request).await?;
             println!(
                 "reply service {:#04x}: {}",
