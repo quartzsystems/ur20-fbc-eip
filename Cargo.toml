@@ -1,0 +1,32 @@
+[workspace]
+resolver = "3"
+members = ["crates/cip", "crates/ur20-fbc-eip", "crates/cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+# repository = "https://github.com/<owner>/ur20-fbc-eip"  # TODO: set before publishing
+keywords = ["weidmuller", "u-remote", "ethernet-ip", "cip", "fieldbus"]
+categories = ["hardware-support", "network-programming", "embedded"]
+
+[workspace.dependencies]
+ur20-fbc-eip-cip = { path = "crates/cip", version = "0.1.0" }
+ur20-fbc-eip = { path = "crates/ur20-fbc-eip", version = "0.1.0" }
+thiserror = "2"
+tracing = "0.1"
+tokio = { version = "1", default-features = false }
+clap = { version = "4", features = ["derive", "env"] }
+anyhow = "1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+indexing_slicing = "warn"

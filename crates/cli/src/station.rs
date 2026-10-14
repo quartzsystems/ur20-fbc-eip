@@ -1,0 +1,226 @@
+// Copyright (C), 2026 Quartz Systems. Some rights reserved. This work is
+// licensed under the terms of the MIT license which can be found in the
+// root directory of this project.
+
+//! Commands that use the module layer: slots, dump-inputs, watch, set.
+
+use std::collections::HashMap;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use clap::Args;
+use ur20_fbc_eip::cip::{Client, hex};
+use ur20_fbc_eip::{ChannelValue, Coupler, CouplerLayout, InputImage, modules};
+
+use crate::parse;
+
+/// Which modules are plugged in and where the coupler keeps their data.
+#[derive(Debug, Args)]
+pub struct StationArgs {
+    /// Modules in slot order, comma separated (e.g. UR20-4DI-P,UR20-4DO-P).
+    /// Omit to use the module list the coupler reports.
+    #[arg(short, long, env = "UR20_EIP_MODULES", value_delimiter = ',')]
+    pub modules: Vec<String>,
+
+    /// Input assembly instance (attribute 3).
+    #[arg(long, default_value_t = 111, value_parser = parse::int::<u32>)]
+    pub input_assembly: u32,
+
+    /// Output assembly instance (attribute 3).
+    #[arg(long, default_value_t = 112, value_parser = parse::int::<u32>)]
+    pub output_assembly: u32,
+
+    /// Header bytes before module data in the input assembly.
+    #[arg(long, default_value_t = 2)]
+    pub input_header: usize,
+
+    /// Header bytes before module data in the output assembly.
+    #[arg(long, default_value_t = 2)]
+    pub output_header: usize,
+
+    /// Skip comparing the module list with the coupler's slot sizes.
+    #[arg(long)]
+    pub no_verify: bool,
+}
+
+impl StationArgs {
+    fn layout(&self) -> CouplerLayout {
+        CouplerLayout::default()
+            .with_input_instance(self.input_assembly)
+            .with_output_instance(self.output_assembly)
+            .with_header_lens(self.input_header, self.output_header)
+    }
+
+    /// Fail early, before connecting, on an unknown module name.
+    pub fn check_modules(&self) -> Result<()> {
+        modules::create_all(&self.modules)?;
+        Ok(())
+    }
+
+    pub async fn coupler(&self, client: Client) -> Result<Coupler<Client>> {
+        if self.modules.is_empty() {
+            let coupler = Coupler::detect(client, self.layout())
+                .await
+                .context("detecting modules (pass --modules to set them by hand)")?;
+            let names: Vec<_> = coupler
+                .station()
+                .slots()
+                .iter()
+                .map(|s| s.module.name())
+                .collect();
+            tracing::info!(modules = %names.join(","), "detected station");
+            return Ok(coupler);
+        }
+        let modules = modules::create_all(&self.modules)?;
+        let mut coupler = Coupler::new(client, self.layout(), modules)?;
+        if !self.no_verify {
+            coupler
+                .verify_station()
+                .await
+                .context("module list does not match the coupler (use --no-verify to skip)")?;
+        }
+        Ok(coupler)
+    }
+}
+
+/// `ur20eip slots`
+pub async fn slots(client: Client) -> Result<()> {
+    let mut coupler = Coupler::new(client, CouplerLayout::default(), Vec::new())?;
+    let slots = coupler.discover_slots().await?;
+    if slots.is_empty() {
+        println!("no slots reported");
+    }
+    for s in slots {
+        let id = s
+            .module_id
+            .map(|id| format!("{id:#010x}"))
+            .unwrap_or_else(|| "-".into());
+        let support = match s.module_id.map(modules::by_id) {
+            Some(Ok(_)) => "supported",
+            Some(Err(_)) => "not supported yet",
+            None => "",
+        };
+        println!(
+            "slot {:>2}: {:<20} id {id}  in {:>3} bit(s)  out {:>3} bit(s)  {support}",
+            s.position,
+            s.name.as_deref().unwrap_or("?"),
+            s.input_bits,
+            s.output_bits,
+        );
+    }
+    Ok(())
+}
+
+fn print_image(img: &InputImage, raw: Option<&[u8]>) {
+    if let Some(raw) = raw {
+        println!("raw [{}]: {}", raw.len(), hex(raw));
+    }
+    match img.status_word {
+        Some(w) => println!("status word: {w:#06x}"),
+        None => println!("header: {}", hex(&img.header)),
+    }
+    for slot in &img.slots {
+        let values: Vec<String> = slot.values.iter().map(ToString::to_string).collect();
+        println!(
+            "slot {:>2} {:<18} {}",
+            slot.position,
+            slot.module,
+            values.join(" ")
+        );
+    }
+    if !img.trailer.is_empty() {
+        println!("trailer: {}", hex(&img.trailer));
+    }
+}
+
+/// `ur20eip dump-inputs`
+pub async fn dump_inputs(coupler: &mut Coupler<Client>, raw: bool) -> Result<()> {
+    let data = coupler.read_input_assembly().await?;
+    let img = coupler.decode_input_assembly(&data)?;
+    print_image(&img, raw.then_some(data.as_slice()));
+    Ok(())
+}
+
+/// `ur20eip dump-outputs`
+pub async fn dump_outputs(coupler: &mut Coupler<Client>) -> Result<()> {
+    let img = coupler.read_outputs().await?;
+    println!("header: {}", hex(&img.header));
+    for slot in &img.slots {
+        let values: Vec<String> = slot.values.iter().map(ToString::to_string).collect();
+        println!(
+            "slot {:>2} {:<18} {}",
+            slot.position,
+            slot.module,
+            values.join(" ")
+        );
+    }
+    Ok(())
+}
+
+/// `ur20eip watch`
+pub async fn watch(coupler: &mut Coupler<Client>, interval: Duration) -> Result<()> {
+    let mut last: HashMap<(usize, usize), ChannelValue> = HashMap::new();
+    let mut last_status = None;
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let start = tokio::time::Instant::now();
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = tokio::signal::ctrl_c() => return Ok(()),
+        }
+        let img = coupler.read_inputs().await?;
+        let t = start.elapsed().as_secs_f64();
+        if img.status_word != last_status {
+            if let Some(w) = img.status_word {
+                println!("{t:>9.3}s status word {w:#06x}");
+            }
+            last_status = img.status_word;
+        }
+        for slot in img.slots {
+            for (ch, value) in slot.values.into_iter().enumerate() {
+                let key = (slot.position, ch);
+                if last.get(&key) != Some(&value) {
+                    let was = last
+                        .get(&key)
+                        .map(|v| format!(" (was {v})"))
+                        .unwrap_or_default();
+                    println!(
+                        "{t:>9.3}s slot {:>2} {:<18} ch {ch:>2} = {value}{was}",
+                        slot.position, slot.module
+                    );
+                    last.insert(key, value);
+                }
+            }
+        }
+    }
+}
+
+/// `ur20eip set`
+pub async fn set(
+    coupler: &mut Coupler<Client>,
+    slot: usize,
+    channel: usize,
+    value: &str,
+    write_timeout: Duration,
+    enable: bool,
+) -> Result<()> {
+    let module = &coupler.station().slot(slot)?.module;
+    let kind = module.output_kind(channel).with_context(|| {
+        format!(
+            "{} in slot {slot} has {} output channel(s)",
+            module.name(),
+            module.output_channels()
+        )
+    })?;
+    let value = ChannelValue::parse(value, kind)?;
+    if enable {
+        coupler
+            .enable_explicit_outputs(write_timeout)
+            .await
+            .context("enabling explicit output writes (is a PLC connected?)")?;
+    }
+    coupler.set_output(slot, channel, value.clone()).await?;
+    println!("slot {slot} channel {channel} = {value}");
+    Ok(())
+}

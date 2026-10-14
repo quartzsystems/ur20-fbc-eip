@@ -1,0 +1,21 @@
+[package]
+name = "ur20-fbc-eip-cip"
+description = "EtherNet/IP encapsulation and CIP explicit messaging (async, tokio) used by the ur20-fbc-eip Weidmüller u-remote driver"
+readme = "../../README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["net", "io-util", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["net", "io-util", "time", "rt", "macros"] }
+
+[lints]
+workspace = true

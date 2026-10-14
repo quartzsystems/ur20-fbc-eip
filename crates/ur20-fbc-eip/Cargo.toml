@@ -1,0 +1,22 @@
+[package]
+name = "ur20-fbc-eip"
+description = "Weidmüller u-remote UR20-FBC-EIP EtherNet/IP fieldbus coupler and UR20 I/O module library"
+readme = "../../README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+ur20-fbc-eip-cip.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["net"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "time", "signal"] }
+
+[lints]
+workspace = true

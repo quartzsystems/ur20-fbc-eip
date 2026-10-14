@@ -1,0 +1,26 @@
+[package]
+name = "ur20-fbc-eip-cli"
+description = "ur20eip: command-line bring-up tool for the Weidmüller u-remote UR20-FBC-EIP EtherNet/IP coupler"
+readme = "../../README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories = ["command-line-utilities", "hardware-support"]
+
+[[bin]]
+name = "ur20eip"
+path = "src/main.rs"
+
+[dependencies]
+ur20-fbc-eip-cip.workspace = true
+ur20-fbc-eip.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "signal"] }
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true
