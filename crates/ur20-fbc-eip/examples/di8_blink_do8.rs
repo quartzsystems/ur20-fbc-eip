@@ -33,6 +33,9 @@ async fn main() -> Result<()> {
 
     let mut do8 = false;
     loop {
+        // Writes are rare here; make sure the 2 s write access has not lapsed (no I/O
+        // unless it is about to).
+        coupler.keep_explicit_outputs_alive().await?;
         let di8 = coupler.read_inputs().await?.bit(1, 8).unwrap_or(false);
         let next = di8 && !do8; // flip while DI8 is on, otherwise off
         if next != do8 {

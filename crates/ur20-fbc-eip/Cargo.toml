@@ -14,10 +14,10 @@ categories.workspace = true
 ur20-fbc-eip-cip.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-tokio = { workspace = true, features = ["net"] }
+tokio = { workspace = true, features = ["net", "time"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "macros", "time", "signal"] }
+tokio = { workspace = true, features = ["rt", "macros", "time", "signal", "test-util", "io-util"] }
 
 [lints]
 workspace = true

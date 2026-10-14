@@ -98,6 +98,7 @@ ur20eip slots                      # module name, ID and bit sizes per slot
 ur20eip dump-inputs --raw
 ur20eip dump-outputs
 ur20eip watch --interval 100ms
+ur20eip watch --reconnect --write-access 2s   # survive coupler reboots, hold write access
 ur20eip set 2 0 on                 # slot 2, channel 0
 ur20eip set-many 2:0=on 2:1=off    # one read and one write, all or nothing
 ur20eip diag                       # status word, coupler and per-slot diagnosis

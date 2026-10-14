@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use ur20_fbc_eip::cip::codec::Reader;
 use ur20_fbc_eip::cip::message::{CipStatus, MessageResponse, service};
-use ur20_fbc_eip::cip::{CipService, MessageRequest};
+use ur20_fbc_eip::cip::{AttributePath, CipService, MessageRequest};
 use ur20_fbc_eip::{ChannelValue, Coupler, CouplerLayout, Error, RawBit, modules};
 
 /// Attributes keyed by (class, instance, attribute), all 8-bit path segments.
@@ -24,6 +24,8 @@ use ur20_fbc_eip::{ChannelValue, Coupler, CouplerLayout, Error, RawBit, modules}
 struct MockCoupler {
     attrs: HashMap<(u8, u8, u8), Vec<u8>>,
     log: Vec<(u8, (u8, u8, u8))>,
+    /// When the last request arrived, for the explicit-write lapse.
+    last: Option<tokio::time::Instant>,
 }
 
 /// 0x65/n/116 of a healthy UR20-16DI-P (byte 4 = 0x70) or UR20-16DO-P (0x72), 2026-10-14.
@@ -153,6 +155,22 @@ impl CipService for MockCoupler {
         let key = (p[1], p[3], p[5]);
         let data = r.rest().to_vec();
         self.log.push((svc, key));
+        // Like the hardware: write access falls back to 0 once no request has arrived for
+        // the timeout in 0x66/1/107 (seen after ~5 s with a 5 s timeout, 2026-10-13).
+        let now = tokio::time::Instant::now();
+        let secs = self
+            .attrs
+            .get(&(0x66, 1, 107))
+            .and_then(|v| v.first_chunk::<2>().map(|b| u16::from_le_bytes(*b)))
+            .unwrap_or(0);
+        let lapsed = secs > 0
+            && self
+                .last
+                .is_some_and(|last| now - last >= Duration::from_secs(u64::from(secs)));
+        if let Some(v) = self.attrs.get_mut(&(0x66, 1, 108)).filter(|_| lapsed) {
+            *v = vec![0];
+        }
+        self.last = Some(now);
         Ok(match svc {
             service::GET_ATTRIBUTE_SINGLE => match self.attrs.get(&key) {
                 Some(v) => MessageResponse::success(svc, v.clone()),
@@ -622,4 +640,127 @@ async fn diagnosis_edge_cases() {
             .map(|s| s.general),
         Some(0x14)
     );
+}
+
+/// Writes to 0x66/1/107 or 108 since log entry `from`.
+fn access_writes(c: &mut Coupler<MockCoupler>, from: usize) -> usize {
+    c.service_mut().log[from..]
+        .iter()
+        .filter(|(svc, key)| {
+            *svc == service::SET_ATTRIBUTE_SINGLE && matches!(key, (0x66, 1, 107 | 108))
+        })
+        .count()
+}
+
+async fn bench_with_access(timeout: Duration) -> Coupler<MockCoupler> {
+    let mut c = Coupler::detect(MockCoupler::bench(), CouplerLayout::default())
+        .await
+        .unwrap();
+    c.enable_explicit_outputs(timeout).await.unwrap();
+    c
+}
+
+#[tokio::test(start_paused = true)]
+async fn mock_models_the_lapse() {
+    let mut c = bench_with_access(Duration::from_secs(2)).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    // bypassing the coupler's tracking: the write hits a lapsed access and is refused
+    let r = c
+        .service_mut()
+        .set_attribute_single(AttributePath::new(0x04, 112, 3), &[0, 0, 1, 0])
+        .await
+        .unwrap_err();
+    assert_eq!(r.cip_status().map(|s| s.general), Some(0x0F));
+    assert!(!c.explicit_outputs_enabled().await.unwrap());
+}
+
+#[tokio::test(start_paused = true)]
+async fn write_after_idle_reasserts_access() {
+    let mut c = bench_with_access(Duration::from_secs(2)).await;
+    c.set_output(2, 8, ChannelValue::Bit(true)).await.unwrap();
+
+    tokio::time::sleep(Duration::from_secs(10)).await; // far past the timeout
+    let before = c.service_mut().log.len();
+    c.set_output(2, 8, ChannelValue::Bit(false)).await.unwrap();
+    assert_eq!(
+        access_writes(&mut c, before),
+        2,
+        "107 and 108 re-written first"
+    );
+    assert_eq!(c.service_mut().attrs[&(0x04, 112, 3)], [0, 0, 0, 0]);
+
+    // same for the one-request image path
+    let img = c.read_outputs().await.unwrap();
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    c.write_outputs(&img).await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn keep_alive_threshold_is_three_quarters_of_the_timeout() {
+    let mut c = bench_with_access(Duration::from_secs(2)).await;
+    assert_eq!(c.explicit_outputs_timeout(), Some(Duration::from_secs(2)));
+    let before = c.service_mut().log.len();
+    assert!(!c.keep_explicit_outputs_alive().await.unwrap());
+    tokio::time::sleep(Duration::from_millis(1400)).await;
+    assert!(!c.keep_explicit_outputs_alive().await.unwrap());
+    assert_eq!(
+        c.service_mut().log.len(),
+        before,
+        "no traffic below the threshold"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await; // 1.6 s >= 1.5 s
+    assert!(c.keep_explicit_outputs_alive().await.unwrap());
+    assert_eq!(access_writes(&mut c, before), 2);
+    // and that counted as traffic
+    assert!(!c.keep_explicit_outputs_alive().await.unwrap());
+}
+
+#[tokio::test(start_paused = true)]
+async fn polling_faster_than_the_timeout_needs_no_reassert() {
+    let mut c = bench_with_access(Duration::from_secs(2)).await;
+    let before = c.service_mut().log.len();
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        c.read_inputs().await.unwrap();
+        assert!(!c.keep_explicit_outputs_alive().await.unwrap());
+    }
+    c.set_output(2, 0, ChannelValue::Bit(true)).await.unwrap();
+    assert_eq!(access_writes(&mut c, before), 0);
+    assert!(c.explicit_outputs_enabled().await.unwrap());
+}
+
+#[tokio::test(start_paused = true)]
+async fn no_keep_alive_without_request_or_with_zero_timeout() {
+    let mut c = Coupler::detect(MockCoupler::bench(), CouplerLayout::default())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert!(!c.keep_explicit_outputs_alive().await.unwrap());
+    assert_eq!(c.explicit_outputs_timeout(), None);
+
+    c.enable_explicit_outputs(Duration::ZERO).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert!(!c.keep_explicit_outputs_alive().await.unwrap());
+
+    // disabled in the layout: nothing to keep alive
+    let layout = CouplerLayout {
+        explicit_write: None,
+        ..CouplerLayout::default()
+    };
+    let mut c = Coupler::detect(MockCoupler::bench(), layout).await.unwrap();
+    c.enable_explicit_outputs(Duration::from_secs(2))
+        .await
+        .unwrap();
+    assert_eq!(c.explicit_outputs_timeout(), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn disable_gives_up_access() {
+    let mut c = bench_with_access(Duration::from_secs(2)).await;
+    c.disable_explicit_outputs().await.unwrap();
+    assert!(!c.explicit_outputs_enabled().await.unwrap());
+    assert_eq!(c.explicit_outputs_timeout(), None);
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert!(!c.keep_explicit_outputs_alive().await.unwrap());
+    assert!(c.set_output(2, 0, ChannelValue::Bit(true)).await.is_err());
 }

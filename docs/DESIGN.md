@@ -112,6 +112,18 @@ c.open_connected(ConnectionParams::explicit_class3()).await?;      // Forward_Op
 c.close().await?;                                                   // Forward_Close + UnRegister
 ```
 
+Lifecycle: there is no async `Drop`, so **call `close()`**. A client that is only dropped
+sends UnRegisterSession with a synchronous non-blocking `try_write` (works without a runtime
+context and during runtime shutdown; skipped if the stream is broken) and closes the socket;
+the target then drops any class 3 connection of that session. After a timeout or framing
+error the client is `is_broken()` and refuses requests with `Error::Broken`;
+`reconnect()` rebuilds the TCP connection and session in place (same peer and timeout) and
+re-opens class 3 if it was open. On failure the client is left unchanged, so it can be retried.
+
+```rust
+if c.is_broken() { c.reconnect().await?; }
+```
+
 `CipService` is a trait (`send` + provided `get_attribute_single` etc.) so the coupler can be
 tested against an in-memory mock. Errors are a single `cip::Error` (thiserror) carrying
 encapsulation status, CIP general/extended status, timeouts and malformed-frame details.
@@ -158,6 +170,9 @@ let d = cpl.diagnosis().await?;                  // CouplerDiagnosis { status: S
 d.status.output_supply_error();                  // named only where confirmed on hardware
 let s = cpl.slot_diagnosis(2).await?;            // SlotDiagnosis { module: Option<ModuleDiagnosis>, … }
 cpl.verify_station().await?;                     // ID or size mismatch → Err
+cpl.keep_explicit_outputs_alive().await?;        // re-assert 0x66/1/108 after ≥ ¾ timeout idle
+if cpl.is_broken() { cpl.reconnect().await?; }   // Coupler<Client>: keeps layout + station,
+                                                 // re-requests write access if it was enabled
 ```
 
 Adding a module is one new file in `modules/` plus one identifier in the `register_modules!`
@@ -173,7 +188,8 @@ ur20eip [--addr IP[:PORT] | $UR20_EIP_ADDR] [--timeout-ms N] [--connected]
   slots                                      per-slot name, ID and bit sizes (class 0x65)
   dump-inputs  --modules A,B,C [layout opts] [--raw]  decoded input image
   dump-outputs --modules …                   decoded output image
-  watch        --modules … --interval 250ms  print changed input channels
+  watch        --modules … --interval 250ms [--reconnect] [--write-access 2s]
+                                             print changed input channels
   set <slot> <channel> <value> --modules … [--write-timeout 5s] [--no-enable]
                                              read-modify-write one output channel
   set-many <slot:ch=value>… --modules … [--write-timeout 5s] [--no-enable]

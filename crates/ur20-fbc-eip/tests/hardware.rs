@@ -148,13 +148,23 @@ async fn digital_writes_outputs() {
         "after {timeout:?} + 1.5 s idle: 0x66/1/108 = {enabled}, assembly 112 = {}",
         hex(&after)
     );
-    // tidy up whatever the lapse did
-    c.enable_explicit_outputs(timeout).await.unwrap();
+    // The next write re-asserts access by itself (Coupler keeps it alive).
     c.write_outputs(&saved).await.unwrap();
+    assert!(c.explicit_outputs_enabled().await.unwrap());
+    assert_eq!(c.read_outputs().await.unwrap(), saved);
     assert!(
         !enabled,
         "explicit write access should lapse after {timeout:?} without traffic"
     );
+
+    // Polling slower than the timeout, writing every poll: no write may be refused.
+    for i in 0..3 {
+        tokio::time::sleep(timeout + Duration::from_millis(500)).await;
+        c.set_output(slot, 0, Bit(i % 2 == 0)).await.unwrap();
+    }
+    c.write_outputs(&saved).await.unwrap();
+    c.disable_explicit_outputs().await.unwrap();
+    c.close().await.unwrap();
 }
 
 #[tokio::test]

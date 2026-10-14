@@ -34,6 +34,21 @@ struct Connected {
 ///
 /// Requests go out as UCMM (SendRRData) until [`Client::open_connected`] succeeds; after that,
 /// [`CipService::send`] uses the class 3 connection (SendUnitData).
+///
+/// # Closing
+///
+/// Call [`Client::close`] when done: it sends Forward_Close for an open class 3 connection,
+/// unregisters the session, shuts the socket down and reports errors. Rust has no async
+/// `Drop`, so a client that is simply dropped can only do part of that: it sends
+/// UnRegisterSession with a non-blocking write (no runtime needed, never blocks, errors
+/// ignored) unless the stream is [broken](Client::is_broken), and then closes the socket.
+/// The target closes any class 3 connection of a session whose TCP connection ends.
+///
+/// # Reconnecting
+///
+/// After a timeout or framing error the client is [broken](Client::is_broken) and every
+/// request fails with [`Error::Broken`]. [`Client::reconnect`] replaces the TCP connection
+/// and session in place and re-opens a class 3 connection if one was open.
 #[derive(Debug)]
 pub struct Client {
     stream: TcpStream,
@@ -43,6 +58,8 @@ pub struct Client {
     timeout: Duration,
     connected: Option<Connected>,
     broken: bool,
+    /// [`Client::close`] ran, so `Drop` has nothing left to do.
+    closed: bool,
 }
 
 impl Client {
@@ -72,6 +89,7 @@ impl Client {
             timeout,
             connected: None,
             broken: false,
+            closed: false,
         };
         let reply = client
             .transact(command::REGISTER_SESSION, encap::register_session_data())
@@ -99,6 +117,35 @@ impl Client {
     /// Change the per-request timeout.
     pub fn set_timeout(&mut self, timeout: Duration) {
         self.timeout = timeout;
+    }
+
+    /// An earlier timeout or framing error left the stream in an unknown state; every
+    /// request now fails with [`Error::Broken`] until [`Client::reconnect`].
+    pub fn is_broken(&self) -> bool {
+        self.broken
+    }
+
+    /// Replace the TCP connection and session with fresh ones to the same peer, with the same
+    /// timeout. If a class 3 connection was open, a new one is opened with the same
+    /// parameters (and a new connection serial). The old session is closed best-effort.
+    ///
+    /// On error `self` is left as it was, so it can be retried.
+    pub async fn reconnect(&mut self) -> Result<()> {
+        let mut fresh = Self::connect_with_timeout(self.peer, self.timeout).await?;
+        if let Some(state) = &self.connected {
+            let params = ConnectionParams {
+                connection_serial: 0,
+                t_o_connection_id: 0,
+                ..state.params.clone()
+            };
+            fresh.open_connected(params).await?;
+        }
+        let old = std::mem::replace(self, fresh);
+        debug!(peer = %self.peer, was_broken = old.broken, "reconnected");
+        if let Err(e) = old.close().await {
+            debug!(error = %e, "closing the old session");
+        }
+        Ok(())
     }
 
     /// The open class 3 connection, if any.
@@ -258,6 +305,7 @@ impl Client {
 
     /// Close the class 3 connection (if any) and unregister the session.
     pub async fn close(mut self) -> Result<()> {
+        self.closed = true;
         if !self.broken {
             if let Err(e) = self.close_connected().await {
                 warn!(error = %e, "Forward_Close failed");
@@ -330,6 +378,28 @@ impl Client {
         let mut data = vec![0u8; usize::from(header.length)];
         read_exact(&mut self.stream, &mut data).await?;
         Ok(Frame { header, data })
+    }
+}
+
+impl Drop for Client {
+    /// Best-effort UnRegisterSession for a client that was not [closed](Client::close).
+    fn drop(&mut self) {
+        if self.closed || self.broken {
+            return;
+        }
+        let Ok(frame) =
+            Frame::request(command::UNREGISTER_SESSION, self.session, 0, Vec::new()).encode()
+        else {
+            return;
+        };
+        // Synchronous and non-blocking: works without a runtime context and during runtime
+        // shutdown. 28 bytes fit any socket send buffer, so a short write means the socket
+        // is already unusable.
+        match self.stream.try_write(&frame) {
+            Ok(n) if n == frame.len() => debug!(peer = %self.peer, "dropped: session unregistered"),
+            Ok(n) => debug!(n, "dropped: partial UnRegisterSession"),
+            Err(e) => debug!(error = %e, "dropped: UnRegisterSession not sent"),
+        }
     }
 }
 

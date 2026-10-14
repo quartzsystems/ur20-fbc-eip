@@ -11,6 +11,8 @@
     clippy::panic
 )]
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -71,7 +73,38 @@ fn handle_mr(req: &[u8]) -> MessageResponse {
     }
 }
 
-async fn serve(mut s: TcpStream) {
+/// What the adapter saw, and a switch to make it hang up.
+#[derive(Default)]
+struct AdapterState {
+    /// Encapsulation commands received, all connections.
+    log: Mutex<Vec<u16>>,
+    /// Read the next SendRRData/SendUnitData, then close the socket without replying.
+    kill_next: AtomicBool,
+}
+
+impl AdapterState {
+    fn count(&self, cmd: u16) -> usize {
+        self.log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| **c == cmd)
+            .count()
+    }
+
+    /// Wait (up to 2 s) until `cmd` has been received `n` times.
+    async fn wait_for(&self, cmd: u16, n: usize) -> bool {
+        for _ in 0..200 {
+            if self.count(cmd) >= n {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+}
+
+async fn serve(mut s: TcpStream, state: Arc<AdapterState>) {
     let mut t_o_id = 0;
     loop {
         let mut head = [0u8; HEADER_LEN];
@@ -80,7 +113,15 @@ async fn serve(mut s: TcpStream) {
         }
         let h = Header::decode(&head).unwrap();
         let mut data = vec![0; usize::from(h.length)];
-        s.read_exact(&mut data).await.unwrap();
+        if s.read_exact(&mut data).await.is_err() {
+            return;
+        }
+        state.log.lock().unwrap().push(h.command);
+        if matches!(h.command, command::SEND_RR_DATA | command::SEND_UNIT_DATA)
+            && state.kill_next.swap(false, Ordering::SeqCst)
+        {
+            return; // hang up mid-request
+        }
         let reply_data = match h.command {
             command::REGISTER_SESSION => data,
             command::UNREGISTER_SESSION => return,
@@ -121,14 +162,20 @@ async fn serve(mut s: TcpStream) {
 }
 
 async fn spawn_adapter() -> std::net::SocketAddr {
+    spawn_adapter_with_state().await.0
+}
+
+async fn spawn_adapter_with_state() -> (std::net::SocketAddr, Arc<AdapterState>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let state = Arc::new(AdapterState::default());
+    let shared = state.clone();
     tokio::spawn(async move {
         while let Ok((s, _)) = listener.accept().await {
-            tokio::spawn(serve(s));
+            tokio::spawn(serve(s, shared.clone()));
         }
     });
-    addr
+    (addr, state)
 }
 
 #[tokio::test]
@@ -211,4 +258,153 @@ async fn timeout_marks_client_broken() {
     assert!(matches!(r, Err(Error::Timeout(_))));
     let r = c.get_attribute_single(AttributePath::new(1, 1, 1)).await;
     assert!(matches!(r, Err(Error::Broken)));
+}
+
+const INPUTS: AttributePath = AttributePath::new(0x04, 111, 3);
+
+#[tokio::test]
+async fn close_unregisters_once() {
+    let (addr, state) = spawn_adapter_with_state().await;
+    let c = Client::connect(addr).await.unwrap();
+    c.close().await.unwrap();
+    assert!(state.wait_for(command::UNREGISTER_SESSION, 1).await);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        state.count(command::UNREGISTER_SESSION),
+        1,
+        "Drop must not send it again"
+    );
+}
+
+#[tokio::test]
+async fn drop_unregisters_session() {
+    let (addr, state) = spawn_adapter_with_state().await;
+    let mut c = Client::connect(addr).await.unwrap();
+    c.get_attribute_single(INPUTS).await.unwrap();
+    drop(c);
+    assert!(
+        state.wait_for(command::UNREGISTER_SESSION, 1).await,
+        "{:x?}",
+        state.log.lock().unwrap()
+    );
+
+    // with a class 3 connection open as well
+    let mut c = Client::connect(addr).await.unwrap();
+    c.open_connected(ConnectionParams::explicit_class3())
+        .await
+        .unwrap();
+    drop(c);
+    assert!(state.wait_for(command::UNREGISTER_SESSION, 2).await);
+}
+
+#[test]
+fn drop_after_runtime_shutdown_does_not_panic() {
+    // The adapter runs on its own thread and runtime, which outlives the client runtime.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let (addr, _state) = spawn_adapter_with_state().await;
+            tx.send(addr).unwrap();
+            std::future::pending::<()>().await;
+        });
+    });
+    let addr = rx.recv().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let c = rt.block_on(Client::connect(addr)).unwrap();
+    drop(rt);
+    drop(c);
+}
+
+#[tokio::test]
+async fn socket_closed_mid_request_then_reconnect() {
+    let (addr, state) = spawn_adapter_with_state().await;
+    let mut c = Client::connect(addr).await.unwrap();
+    assert_eq!(c.get_attribute_single(INPUTS).await.unwrap(), [0, 0, 5]);
+    assert!(!c.is_broken());
+
+    state.kill_next.store(true, Ordering::SeqCst);
+    let e = c.get_attribute_single(INPUTS).await.unwrap_err();
+    assert!(matches!(e, Error::Closed | Error::Io(_)), "{e:?}");
+    assert!(c.is_broken());
+    assert!(matches!(
+        c.get_attribute_single(INPUTS).await,
+        Err(Error::Broken)
+    ));
+
+    c.reconnect().await.unwrap();
+    assert!(!c.is_broken());
+    assert_eq!(c.get_attribute_single(INPUTS).await.unwrap(), [0, 0, 5]);
+    assert_eq!(state.count(command::REGISTER_SESSION), 2);
+    // a broken stream is never written to: no UnRegisterSession for the dead session
+    assert_eq!(state.count(command::UNREGISTER_SESSION), 0);
+    c.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn reconnect_reopens_class3() {
+    let (addr, state) = spawn_adapter_with_state().await;
+    let mut c = Client::connect(addr).await.unwrap();
+    c.open_connected(ConnectionParams::explicit_class3())
+        .await
+        .unwrap();
+    let first = c.connection().unwrap().clone();
+
+    state.kill_next.store(true, Ordering::SeqCst);
+    assert!(c.get_attribute_single(INPUTS).await.is_err());
+    assert!(c.is_broken());
+
+    c.reconnect().await.unwrap();
+    let second = c.connection().expect("class 3 re-opened").clone();
+    assert_ne!(
+        first.connection_serial, second.connection_serial,
+        "new connection triad"
+    );
+    // goes over SendUnitData; the adapter checks the connection ID
+    assert_eq!(c.get_attribute_single(INPUTS).await.unwrap(), [0, 0, 5]);
+    assert!(state.count(command::SEND_UNIT_DATA) >= 1);
+    c.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn reconnect_keeps_peer_and_timeout_and_closes_old_session() {
+    let (addr, state) = spawn_adapter_with_state().await;
+    let mut c = Client::connect_with_timeout(addr, Duration::from_millis(200))
+        .await
+        .unwrap();
+    // reconnecting a healthy client is allowed and unregisters the old session
+    c.reconnect().await.unwrap();
+    assert!(!c.is_broken());
+    assert_eq!(c.peer_addr(), addr);
+    assert_eq!(c.timeout(), Duration::from_millis(200));
+    assert!(state.wait_for(command::UNREGISTER_SESSION, 1).await);
+    assert_eq!(c.get_attribute_single(INPUTS).await.unwrap(), [0, 0, 5]);
+}
+
+#[tokio::test]
+async fn reconnect_failure_leaves_client_broken_and_retryable() {
+    // a target that accepts exactly one TCP connection, then goes away
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state = Arc::new(AdapterState::default());
+    let shared = state.clone();
+    tokio::spawn(async move {
+        let (s, _) = listener.accept().await.unwrap();
+        drop(listener);
+        serve(s, shared).await;
+    });
+    let mut c = Client::connect_with_timeout(addr, Duration::from_millis(200))
+        .await
+        .unwrap();
+    state.kill_next.store(true, Ordering::SeqCst);
+    assert!(c.get_attribute_single(INPUTS).await.is_err());
+    assert!(c.reconnect().await.is_err());
+    assert!(c.is_broken(), "unchanged after a failed reconnect");
+    assert_eq!(c.peer_addr(), addr);
 }

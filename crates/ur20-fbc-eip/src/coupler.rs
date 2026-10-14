@@ -7,6 +7,7 @@
 use std::time::Duration;
 
 use tokio::net::ToSocketAddrs;
+use tokio::time::Instant;
 use tracing::{debug, info};
 use ur20_fbc_eip_cip::{AttributePath, CipService, Client, Identity};
 
@@ -114,11 +115,25 @@ fn split_header<'a>(what: &str, data: &'a [u8], header_len: usize) -> Result<(&'
 /// A UR20-FBC-EIP coupler and the modules plugged into it.
 ///
 /// Generic over [`CipService`] so it can run on a [`Client`] or on a test double.
+///
+/// # Explicit write access
+///
+/// After [`Coupler::enable_explicit_outputs`] the coupler accepts output writes until no
+/// request has arrived for the timeout (seen on hardware: access fell back about 5 s after
+/// the last request with a 5 s timeout). The coupler remembers when it last sent a request and
+/// re-asserts access before an output write if the link has been idle for ¾ of the timeout
+/// or more, so a write after a long pause still works. Long-running loops that do not write
+/// can call [`Coupler::keep_explicit_outputs_alive`] each iteration. Requests sent through
+/// [`Coupler::service_mut`] are not tracked.
 #[derive(Debug)]
 pub struct Coupler<S = Client> {
     service: S,
     layout: CouplerLayout,
     station: Station,
+    /// Timeout passed to the last [`Coupler::enable_explicit_outputs`], as written.
+    explicit_timeout: Option<Duration>,
+    /// When the last request through this coupler got an answer from the device.
+    last_request: Option<Instant>,
 }
 
 impl Coupler<Client> {
@@ -136,6 +151,31 @@ impl Coupler<Client> {
     pub async fn connect_auto(addr: impl ToSocketAddrs, layout: CouplerLayout) -> Result<Self> {
         let client = Client::connect(addr).await?;
         Self::detect(client, layout).await
+    }
+
+    /// The client is unusable after a timeout or framing error; see [`Coupler::reconnect`].
+    pub fn is_broken(&self) -> bool {
+        self.service.is_broken()
+    }
+
+    /// Replace the TCP connection and session ([`Client::reconnect`]), keeping the layout and
+    /// station. A class 3 connection is re-opened if one was open, and explicit write access
+    /// is requested again if [`Coupler::enable_explicit_outputs`] was called.
+    ///
+    /// On error the coupler is unchanged and the call can be retried.
+    pub async fn reconnect(&mut self) -> Result<()> {
+        self.service.reconnect().await?;
+        info!(peer = %self.service.peer_addr(), "reconnected");
+        if let Some(timeout) = self.explicit_timeout {
+            self.write_explicit_enable(timeout).await?;
+        }
+        Ok(())
+    }
+
+    /// Close the session ([`Client::close`]). Dropping the coupler instead only sends a
+    /// best-effort UnRegisterSession.
+    pub async fn close(self) -> Result<()> {
+        Ok(self.service.close().await?)
     }
 }
 
@@ -199,7 +239,9 @@ impl<S: CipService> Coupler<S> {
             .into_iter()
             .map(|id| modules::by_id(id).map(|d| d.instantiate()))
             .collect::<Result<Vec<_>>>()?;
-        Self::new(service, layout, modules)
+        let mut coupler = Self::new(service, layout, modules)?;
+        coupler.last_request = Some(Instant::now());
+        Ok(coupler)
     }
 
     /// Wrap an existing transport.
@@ -209,7 +251,34 @@ impl<S: CipService> Coupler<S> {
             service,
             layout,
             station,
+            explicit_timeout: None,
+            last_request: None,
         })
+    }
+
+    /// Note that the device answered (any reply, error status included, is explicit traffic).
+    fn track<T>(&mut self, r: ur20_fbc_eip_cip::Result<T>) -> Result<T> {
+        if r.is_ok() || r.as_ref().is_err_and(|e| e.cip_status().is_some()) {
+            self.last_request = Some(Instant::now());
+        }
+        Ok(r?)
+    }
+
+    /// Get_Attribute_Single, tracked.
+    async fn get(&mut self, path: AttributePath) -> Result<Vec<u8>> {
+        let r = self.service.get_attribute_single(path).await;
+        self.track(r)
+    }
+
+    /// Set_Attribute_Single, tracked.
+    async fn set(&mut self, path: AttributePath, data: &[u8]) -> Result<()> {
+        let r = self.service.set_attribute_single(path, data).await;
+        self.track(r)
+    }
+
+    /// Time since the device last answered a request sent through this coupler.
+    pub fn idle_time(&self) -> Option<Duration> {
+        self.last_request.map(|t| t.elapsed())
     }
 
     /// The configured station.
@@ -234,30 +303,27 @@ impl<S: CipService> Coupler<S> {
 
     /// Identity Object of the coupler.
     pub async fn identity(&mut self) -> Result<Identity> {
-        Ok(self.service.identity().await?)
+        let r = self.service.identity().await;
+        self.track(r)
     }
 
     /// Raw bytes of the input assembly, header included.
     pub async fn read_input_assembly(&mut self) -> Result<Vec<u8>> {
-        Ok(self.service.get_attribute_single(self.layout.input).await?)
+        self.get(self.layout.input).await
     }
 
     /// Raw bytes of the output assembly, header included.
     pub async fn read_output_assembly(&mut self) -> Result<Vec<u8>> {
-        Ok(self
-            .service
-            .get_attribute_single(self.layout.output)
-            .await?)
+        self.get(self.layout.output).await
     }
 
     /// Write the whole output assembly, header included.
     ///
-    /// Requires explicit write access, see [`Coupler::enable_explicit_outputs`].
+    /// Requires explicit write access, see [`Coupler::enable_explicit_outputs`]; re-asserts
+    /// it first if it may have lapsed ([`Coupler::keep_explicit_outputs_alive`]).
     pub async fn write_output_assembly(&mut self, data: &[u8]) -> Result<()> {
-        Ok(self
-            .service
-            .set_attribute_single(self.layout.output, data)
-            .await?)
+        self.keep_explicit_outputs_alive().await?;
+        self.set(self.layout.output, data).await
     }
 
     /// Decode an input assembly read earlier.
@@ -335,27 +401,68 @@ impl<S: CipService> Coupler<S> {
     /// Writes the timeout (seconds, rounded up, 0 = until all explicit connections close)
     /// and then sets "Start Explicit Process Data Exchange". The coupler refuses this while a
     /// PLC holds an Exclusive Owner (class 1) connection. Access lapses if no explicit
-    /// request arrives within `timeout`, so keep polling (e.g. [`Coupler::read_inputs`]).
+    /// request arrives within `timeout`. This coupler keeps it alive across idle periods; see
+    /// the [type docs](Coupler#explicit-write-access).
     pub async fn enable_explicit_outputs(&mut self, timeout: Duration) -> Result<()> {
-        let Some(ctrl) = self.layout.explicit_write else {
-            return Ok(());
-        };
         let secs = timeout.as_secs() + u64::from(timeout.subsec_nanos() > 0);
         let secs = u16::try_from(secs).unwrap_or(u16::MAX);
-        self.service
-            .set_attribute_single(ctrl.timeout, &secs.to_le_bytes())
-            .await?;
-        self.service.set_attribute_single(ctrl.start, &[1]).await?;
+        let timeout = Duration::from_secs(u64::from(secs));
+        self.write_explicit_enable(timeout).await?;
+        self.explicit_timeout = self.layout.explicit_write.map(|_| timeout);
         info!(timeout_s = secs, "explicit output write access enabled");
         Ok(())
     }
 
-    /// Whether explicit write access is currently active.
+    /// Write 0x66/1/107 (timeout) and 0x66/1/108 = 1.
+    async fn write_explicit_enable(&mut self, timeout: Duration) -> Result<()> {
+        let Some(ctrl) = self.layout.explicit_write else {
+            return Ok(());
+        };
+        let secs = u16::try_from(timeout.as_secs()).unwrap_or(u16::MAX);
+        self.set(ctrl.timeout, &secs.to_le_bytes()).await?;
+        self.set(ctrl.start, &[1]).await
+    }
+
+    /// Give up explicit write access (0x66/1/108 = 0) and stop keeping it alive.
+    pub async fn disable_explicit_outputs(&mut self) -> Result<()> {
+        self.explicit_timeout = None;
+        let Some(ctrl) = self.layout.explicit_write else {
+            return Ok(());
+        };
+        self.set(ctrl.start, &[0]).await
+    }
+
+    /// Re-assert explicit write access if [`Coupler::enable_explicit_outputs`] was called
+    /// and nothing has been sent for ¾ of its timeout or longer, i.e. the access has lapsed
+    /// or is about to. Returns whether it sent anything. Does nothing with a timeout of 0
+    /// (no lapse) or when access was never requested.
+    ///
+    /// Output writes call this themselves; call it from loops that may sit idle longer
+    /// than the timeout without writing.
+    pub async fn keep_explicit_outputs_alive(&mut self) -> Result<bool> {
+        let Some(timeout) = self.explicit_timeout.filter(|t| !t.is_zero()) else {
+            return Ok(false);
+        };
+        let idle = self.idle_time().unwrap_or(Duration::MAX);
+        if idle < timeout * 3 / 4 {
+            return Ok(false);
+        }
+        debug!(?idle, ?timeout, "re-asserting explicit write access");
+        self.write_explicit_enable(timeout).await?;
+        Ok(true)
+    }
+
+    /// The timeout of the explicit write access this coupler keeps alive, if any.
+    pub fn explicit_outputs_timeout(&self) -> Option<Duration> {
+        self.explicit_timeout
+    }
+
+    /// Whether explicit write access is currently active (reads 0x66/1/108).
     pub async fn explicit_outputs_enabled(&mut self) -> Result<bool> {
         let Some(ctrl) = self.layout.explicit_write else {
             return Ok(true);
         };
-        let v = self.service.get_attribute_single(ctrl.start).await?;
+        let v = self.get(ctrl.start).await?;
         Ok(v.first().is_some_and(|b| *b != 0))
     }
 
@@ -409,6 +516,8 @@ impl<S: CipService> Coupler<S> {
         &mut self,
         change: impl FnOnce(&Station, &mut [u8]) -> Result<()>,
     ) -> Result<()> {
+        // Before the read: the read itself counts as traffic and would hide a lapse.
+        self.keep_explicit_outputs_alive().await?;
         let mut data = self.read_output_assembly().await?;
         let header_len = self.layout.output_header_len;
         if data.len() < header_len {
@@ -491,13 +600,11 @@ impl<S: CipService> Coupler<S> {
     }
 
     async fn slot_attr(&mut self, path: AttributePath) -> Result<SlotAttr> {
-        match self.service.get_attribute_single(path).await {
+        match self.get(path).await {
             Ok(v) => Ok(SlotAttr::Data(v)),
-            Err(e) => match e.cip_status().map(|s| s.general) {
-                Some(0x05 | 0x16) => Ok(SlotAttr::NoSlot),
-                Some(0x14) => Ok(SlotAttr::Missing),
-                _ => Err(e.into()),
-            },
+            Err(e) if e.is_no_slot() => Ok(SlotAttr::NoSlot),
+            Err(e) if e.cip_status().is_some_and(|s| s.general == 0x14) => Ok(SlotAttr::Missing),
+            Err(e) => Err(e),
         }
     }
 
@@ -512,8 +619,7 @@ impl<S: CipService> Coupler<S> {
             .layout
             .diagnosis
             .ok_or_else(|| Error::Unsupported("diagnosis disabled in CouplerLayout".into()))?;
-        let status =
-            StatusWord::decode(&self.service.get_attribute_single(paths.status_word).await?)?;
+        let status = StatusWord::decode(&self.get(paths.status_word).await?)?;
         let latest_event = self
             .service
             .get_attribute_single(paths.latest_event)
@@ -586,7 +692,7 @@ impl<S: CipService> Coupler<S> {
             .layout
             .module_list
             .ok_or_else(|| Error::Unsupported("module list disabled in CouplerLayout".into()))?;
-        parse_module_list(&self.service.get_attribute_single(path).await?)
+        parse_module_list(&self.get(path).await?)
     }
 
     /// [`Coupler::discover_slots`] and compare with the configured modules.

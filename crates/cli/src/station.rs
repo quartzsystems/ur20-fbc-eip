@@ -157,23 +157,106 @@ pub async fn dump_outputs(coupler: &mut Coupler<Client>) -> Result<()> {
     Ok(())
 }
 
-/// `ur20eip watch`
-pub async fn watch(coupler: &mut Coupler<Client>, interval: Duration) -> Result<()> {
-    let mut last: HashMap<(usize, usize), ChannelValue> = HashMap::new();
-    let mut last_status = None;
-    let mut ticker = tokio::time::interval(interval);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let start = tokio::time::Instant::now();
+/// Options of `ur20eip watch`.
+#[derive(Debug, Args)]
+pub struct WatchArgs {
+    /// Poll interval, e.g. 250ms, 1s.
+    #[arg(short, long, default_value = "250ms", value_parser = parse::duration)]
+    pub interval: Duration,
+
+    /// When the connection breaks (timeout, reset, coupler reboot), keep trying to
+    /// reconnect instead of exiting.
+    #[arg(long)]
+    pub reconnect: bool,
+
+    /// Request explicit output write access with this timeout and keep it alive while
+    /// watching, even if --interval is longer than the timeout.
+    #[arg(long, value_name = "TIMEOUT", value_parser = parse::duration)]
+    pub write_access: Option<Duration>,
+}
+
+/// Retry [`Coupler::reconnect`] with backoff until it works; `false` on Ctrl-C.
+async fn reconnect(coupler: &mut Coupler<Client>, start: tokio::time::Instant) -> bool {
+    let mut delay = Duration::from_millis(500);
     loop {
         tokio::select! {
-            _ = ticker.tick() => {}
-            _ = tokio::signal::ctrl_c() => return Ok(()),
+            _ = tokio::time::sleep(delay) => {}
+            _ = tokio::signal::ctrl_c() => return false,
         }
-        let img = coupler.read_inputs().await?;
         let t = start.elapsed().as_secs_f64();
+        match coupler.reconnect().await {
+            Ok(()) => {
+                println!("{t:>9.3}s reconnected");
+                return true;
+            }
+            Err(e) => {
+                tracing::info!(error = %e, "reconnect failed");
+                delay = (delay * 2).min(Duration::from_secs(5));
+            }
+        }
+    }
+}
+
+/// Wait for the next tick of `ticker`, or forever without one.
+async fn tick(ticker: &mut Option<tokio::time::Interval>) {
+    match ticker {
+        Some(t) => {
+            t.tick().await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// `ur20eip watch`
+pub async fn watch(coupler: &mut Coupler<Client>, args: &WatchArgs) -> Result<()> {
+    let start = tokio::time::Instant::now();
+    if let Some(timeout) = args.write_access {
+        coupler
+            .enable_explicit_outputs(timeout)
+            .await
+            .context("enabling explicit output writes (is a PLC connected?)")?;
+    }
+    // Between polls, wake often enough to re-assert write access before it lapses.
+    let mut keepalive = coupler
+        .explicit_outputs_timeout()
+        .filter(|t| !t.is_zero() && args.interval >= *t / 2)
+        .map(|t| {
+            let mut i = tokio::time::interval(t / 2);
+            i.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            i
+        });
+
+    let mut last: HashMap<(usize, usize), ChannelValue> = HashMap::new();
+    let mut last_status = None;
+    let mut ticker = tokio::time::interval(args.interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        let poll = tokio::select! {
+            _ = ticker.tick() => true,
+            _ = tick(&mut keepalive) => false,
+            _ = tokio::signal::ctrl_c() => return Ok(()),
+        };
+        let result = match coupler.keep_explicit_outputs_alive().await {
+            Ok(_) if poll => coupler.read_inputs().await.map(Some),
+            Ok(_) => Ok(None),
+            Err(e) => Err(e),
+        };
+        let t = start.elapsed().as_secs_f64();
+        let img = match result {
+            Ok(Some(img)) => img,
+            Ok(None) => continue,
+            Err(e) if args.reconnect && coupler.is_broken() => {
+                println!("{t:>9.3}s connection lost: {e}; reconnecting");
+                if !reconnect(coupler, start).await {
+                    return Ok(());
+                }
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
         if img.status_word != last_status {
-            if let Some(w) = img.status_word {
-                println!("{t:>9.3}s status word {w:#06x}");
+            if let Some(s) = img.status() {
+                println!("{t:>9.3}s status word {s}");
             }
             last_status = img.status_word;
         }

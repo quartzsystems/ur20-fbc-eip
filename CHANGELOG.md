@@ -28,6 +28,14 @@ All notable changes to this workspace are recorded here. The format follows
   `Error::cip_status()`, `Error::is_no_slot()`, `CouplerLayout::diagnosis`, and
   `SlotClass::diagnosis_attribute` / `process_alarm_attribute`.
 - `ur20eip diag [--slot N] [--raw]`.
+- `Client::reconnect()` / `Client::is_broken()`, and `Coupler::reconnect()` /
+  `Coupler::is_broken()` / `Coupler::close()` for `Coupler<Client>`. Reconnect keeps the
+  layout and station, re-opens class 3 and re-requests explicit write access if it was on.
+- Explicit write access is kept alive: the coupler tracks its last request and re-asserts
+  0x66/1/107+108 before output writes after ≥ ¾ of the timeout idle.
+  `Coupler::keep_explicit_outputs_alive()`, `disable_explicit_outputs()`,
+  `explicit_outputs_timeout()`, `idle_time()`.
+- `ur20eip watch --reconnect` and `--write-access TIMEOUT`.
 
 ### Changed
 
@@ -39,6 +47,8 @@ All notable changes to this workspace are recorded here. The format follows
 
 ### Fixed
 
+- A dropped `Client` (or `Coupler`) now sends UnRegisterSession instead of leaving the
+  session to time out on the coupler; `close()` is still the clean way.
 - `verify_station` passed with a module pulled: the coupler keeps the slot and its old bit
   sizes, so only the module ID shows it. An empty module ID is now reported as 0 (no module)
   and fails verification.

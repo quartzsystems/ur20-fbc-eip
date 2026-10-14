@@ -63,9 +63,8 @@ enum Command {
     Watch {
         #[command(flatten)]
         station: station::StationArgs,
-        /// Poll interval, e.g. 250ms, 1s.
-        #[arg(short, long, default_value = "250ms", value_parser = parse::duration)]
-        interval: Duration,
+        #[command(flatten)]
+        watch: station::WatchArgs,
     },
     /// Set one output channel (read-modify-write of the output assembly).
     Set {
@@ -173,9 +172,9 @@ async fn main() -> Result<()> {
             client = coupler.into_inner();
             r
         }
-        Command::Watch { station, interval } => {
+        Command::Watch { station, watch } => {
             let mut coupler = station.coupler(client).await?;
-            let r = station::watch(&mut coupler, *interval).await;
+            let r = station::watch(&mut coupler, watch).await;
             client = coupler.into_inner();
             r
         }
@@ -263,6 +262,7 @@ mod tests {
             &["dump-inputs", "--raw"],
             &["dump-outputs", "-m", "UR20-16DI-P,UR20-16DO-P"],
             &["watch", "-i", "100ms"],
+            &["watch", "-i", "10s", "--reconnect", "--write-access", "2s"],
             &["set", "2", "8", "on", "--write-timeout", "5s"],
             &["set-many", "2:0=on", "2:15=off", "--no-enable"],
             &["raw", "get", "0x04", "111", "3"],
