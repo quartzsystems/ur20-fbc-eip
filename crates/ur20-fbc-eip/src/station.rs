@@ -218,9 +218,7 @@ impl Station {
         }
         for (slot, r) in self.slots.iter().zip(reported) {
             let expected = slot.module.descriptor();
-            if let Some(id) = r.module_id
-                && id != expected.id
-            {
+            if let Some(id) = r.module_id.filter(|id| *id != expected.id) {
                 let actual = r
                     .name
                     .clone()

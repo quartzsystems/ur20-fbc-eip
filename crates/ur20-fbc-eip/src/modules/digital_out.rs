@@ -93,7 +93,7 @@ impl Module for DigitalOutput {
                 ChannelValue::Bit(b) => *b,
                 other => return Err(wrong_kind(self, n, ValueKind::Bit, other)),
             };
-            if on && let Some(byte) = packed.get_mut(n / 8) {
+            if let Some(byte) = packed.get_mut(n / 8).filter(|_| on) {
                 *byte |= 1 << (n % 8);
             }
         }

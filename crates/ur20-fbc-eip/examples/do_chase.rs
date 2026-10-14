@@ -4,25 +4,28 @@
 
 //! Running light: switch on each DO channel in turn, 0 to 15, and repeat.
 //!
-//! Station: UR20-FBC-EIP at 10.42.30.101, slot 1 = UR20-16DI-P, slot 2 = UR20-16DO-P.
+//! Station: slot 2 = UR20-16DO-P (or another 16-channel digital output module). Coupler
+//! address from `UR20_EIP_ADDR`; module list from
+//! `UR20_EIP_MODULES` or, if unset, read from the coupler.
 //!
 //! ```sh
-//! cargo run -p ur20-fbc-eip --example do_chase
+//! UR20_EIP_ADDR=192.168.1.10 cargo run -p ur20-fbc-eip --example do_chase
 //! ```
 
 use std::time::Duration;
 
-use ur20_fbc_eip::{ChannelValue::Bit, Coupler, CouplerLayout, Result, modules};
+use common::Result;
+use ur20_fbc_eip::{Category, ChannelValue::Bit};
+
+mod common;
 
 /// How long each channel stays on.
 const STEP: Duration = Duration::from_millis(100);
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    let modules = modules::create_all(&["UR20-16DI-P", "UR20-16DO-P"])?;
-    let mut coupler =
-        Coupler::connect("10.42.30.101:44818", CouplerLayout::default(), modules).await?;
-    coupler.verify_station().await?;
+    let mut coupler = common::coupler().await?;
+    common::require(&coupler, 2, Category::DigitalOutput, 16)?;
     coupler
         .enable_explicit_outputs(Duration::from_secs(2))
         .await?;

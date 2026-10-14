@@ -90,15 +90,20 @@ export UR20_EIP_ADDR=192.168.1.10
 ur20eip identity
 ur20eip slots                      # module name, ID and bit sizes per slot
 ur20eip dump-inputs --raw
+ur20eip dump-outputs
 ur20eip watch --interval 100ms
 ur20eip set 2 0 on                 # slot 2, channel 0
 ur20eip raw get 0x04 111 3
 ur20eip raw get-all 0x01 1
 ur20eip raw set 0x66 1 108 01
 ur20eip raw scan 0x64 1 101 130    # which gateway attributes exist?
+ur20eip raw service 0x0e 0x65 1 --attribute 101
 ```
 
-`--connected` uses a class 3 connection instead of unconnected messages.
+`--connected` uses a class 3 connection instead of unconnected messages; `--timeout-ms`
+sets the per-request timeout (default 3000). `--modules`/`UR20_EIP_MODULES` is checked against
+the coupler unless you pass `--no-verify`. `set` requests explicit write access first
+(`--write-timeout 5s`; `--no-enable` skips that). `ur20eip help <command>` lists everything.
 `UR20_EIP_LOG=trace` prints every request and reply in hex.
 
 ## Supported modules

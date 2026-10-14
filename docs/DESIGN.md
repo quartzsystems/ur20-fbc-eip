@@ -157,10 +157,11 @@ until verified.
 ur20eip [--addr IP[:PORT] | $UR20_EIP_ADDR] [--timeout-ms N] [--connected]
   identity                                   Identity object (+ ListIdentity)
   slots                                      per-slot name, ID and bit sizes (class 0x65)
-  dump-inputs  --modules A,B,C [layout opts] decoded input image
+  dump-inputs  --modules A,B,C [layout opts] [--raw]  decoded input image
   dump-outputs --modules …                   decoded output image
   watch        --modules … --interval 250ms  print changed input channels
-  set <slot> <channel> <value> --modules …   read-modify-write one output channel
+  set <slot> <channel> <value> --modules … [--write-timeout 5s] [--no-enable]
+                                             read-modify-write one output channel
   raw get     <class> <instance> <attr>
   raw get-all <class> <instance>
   raw set     <class> <instance> <attr> <hex-bytes>
@@ -168,7 +169,9 @@ ur20eip [--addr IP[:PORT] | $UR20_EIP_ADDR] [--timeout-ms N] [--connected]
   raw service <svc> <class> <instance> [--attribute A] [--data HEX]
 ```
 Layout options: `--input-assembly`, `--output-assembly`, `--input-header`, `--output-header`.
-`--modules` is optional: without it the module list is read from the coupler.
+`--modules` (`$UR20_EIP_MODULES`) is optional: without it the module list is read from the
+coupler; with it the list is verified against the coupler unless `--no-verify` is given.
+`UR20_EIP_LOG` sets the tracing filter (e.g. `trace` for hex dumps of every frame).
 
 ## 7. Bench results and open questions
 

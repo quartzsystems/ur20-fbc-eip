@@ -4,25 +4,29 @@
 
 //! DO channel 8 blinks fast while DI channel 8 is on, and is off otherwise.
 //!
-//! Station: UR20-FBC-EIP at 10.42.30.101, slot 1 = UR20-16DI-P, slot 2 = UR20-16DO-P.
+//! Station: slot 1 = UR20-16DI-P, slot 2 = UR20-16DO-P (or any digital modules with at
+//! least 9 channels in those slots). Coupler address from `UR20_EIP_ADDR`; module list from
+//! `UR20_EIP_MODULES` or, if unset, read from the coupler.
 //!
 //! ```sh
-//! cargo run -p ur20-fbc-eip --example di8_blink_do8
+//! UR20_EIP_ADDR=192.168.1.10 cargo run -p ur20-fbc-eip --example di8_blink_do8
 //! ```
 
 use std::time::Duration;
 
-use ur20_fbc_eip::{ChannelValue::Bit, Coupler, CouplerLayout, Result, modules};
+use common::Result;
+use ur20_fbc_eip::{Category, ChannelValue::Bit};
+
+mod common;
 
 /// Time between toggles: 20 ms on, 20 ms off = 25 Hz.
 const TOGGLE: Duration = Duration::from_millis(20);
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    let modules = modules::create_all(&["UR20-16DI-P", "UR20-16DO-P"])?;
-    let mut coupler =
-        Coupler::connect("10.42.30.101:44818", CouplerLayout::default(), modules).await?;
-    coupler.verify_station().await?;
+    let mut coupler = common::coupler().await?;
+    common::require(&coupler, 1, Category::DigitalInput, 9)?;
+    common::require(&coupler, 2, Category::DigitalOutput, 9)?;
     coupler
         .enable_explicit_outputs(Duration::from_secs(2))
         .await?;

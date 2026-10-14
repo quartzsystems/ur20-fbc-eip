@@ -173,9 +173,7 @@ impl fmt::Display for CipStatus {
             f.write_str(", extended")?;
             for e in &self.extended {
                 write!(f, " {e:#06x}")?;
-                if self.general == 0x01
-                    && let Some(n) = connection_manager_ext_name(*e)
-                {
+                if let (0x01, Some(n)) = (self.general, connection_manager_ext_name(*e)) {
                     write!(f, " ({n})")?;
                 }
             }

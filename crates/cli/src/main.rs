@@ -236,6 +236,56 @@ mod tests {
         }
     }
 
+    const README: &str = include_str!("../../../README.md");
+
+    /// Every `ur20eip …` line in the README's `sh` blocks parses.
+    #[test]
+    fn readme_commands_parse() {
+        let mut count = 0;
+        let mut in_sh = false;
+        for line in README.lines().map(str::trim) {
+            if line.starts_with("```") {
+                in_sh = line == "```sh";
+                continue;
+            }
+            let Some(rest) = line.strip_prefix("ur20eip ").filter(|_| in_sh) else {
+                continue;
+            };
+            let args: Vec<&str> = rest
+                .split('#')
+                .next()
+                .unwrap_or_default()
+                .split_whitespace()
+                .collect();
+            parse(&args);
+            count += 1;
+        }
+        assert!(count >= 10, "only {count} README commands found");
+    }
+
+    /// Every `UR20_EIP_*` variable the README mentions is read by the CLI.
+    #[test]
+    fn readme_env_vars_exist() {
+        fn envs(cmd: &clap::Command, out: &mut Vec<String>) {
+            for a in cmd.get_arguments() {
+                if let Some(e) = a.get_env() {
+                    out.push(e.to_string_lossy().into_owned());
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                envs(sub, out);
+            }
+        }
+        let mut known = vec!["UR20_EIP_LOG".to_owned()]; // read by main() for tracing
+        envs(&Cli::command(), &mut known);
+        let mentioned = README
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|w| w.starts_with("UR20_EIP_"));
+        for var in mentioned {
+            assert!(known.iter().any(|k| k == var), "README mentions {var}");
+        }
+    }
+
     #[test]
     fn raw_set_takes_one_hex_argument() {
         let cli = parse(&["raw", "set", "0x66", "1", "107", "05 00"]);

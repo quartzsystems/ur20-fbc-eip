@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
-# repository = "https://github.com/<owner>/ur20-fbc-eip"  # TODO: set before publishing
+repository = "https://github.com/quartzsystems/ur20-fbc-eip"
 keywords = ["weidmuller", "u-remote", "ethernet-ip", "cip", "fieldbus"]
 categories = ["hardware-support", "network-programming", "embedded"]
 
