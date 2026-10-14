@@ -10,6 +10,7 @@ use tokio::net::ToSocketAddrs;
 use tracing::{debug, info};
 use ur20_fbc_eip_cip::{AttributePath, CipService, Client, Identity};
 
+use crate::diagnosis::{CouplerDiagnosis, GatewayDiagnosis, SlotDiagnosis, StatusWord};
 use crate::error::{Error, Result};
 use crate::layout::CouplerLayout;
 use crate::module::{ChannelValue, Module};
@@ -22,9 +23,7 @@ pub struct InputImage {
     /// Raw header bytes (normally 2).
     pub header: Vec<u8>,
     /// Header as a little-endian word, if it is 2 bytes long: the coupler status word.
-    /// Length confirmed on hardware. Observed on 2026-10-13: 0x0000 on a healthy station,
-    /// 0x0040 (bit 6) while a module was pulled, back to 0x0000 after it returned.
-    /// TODO-verify-on-hardware: the other bits.
+    /// Use [`InputImage::status`] for the named bits ([`StatusWord`]).
     pub status_word: Option<u16>,
     /// Decoded module inputs, slot order, modules without inputs omitted.
     pub slots: Vec<SlotValues>,
@@ -39,6 +38,11 @@ impl InputImage {
             .iter()
             .find(|s| s.position == position)
             .and_then(|s| s.values.get(channel))
+    }
+
+    /// The status word with its confirmed bits named.
+    pub fn status(&self) -> Option<StatusWord> {
+        self.status_word.map(StatusWord)
     }
 
     /// The digital input `channel` of the module in slot `position`, `None` if there is no
@@ -433,6 +437,8 @@ impl<S: CipService> Coupler<S> {
             let module_id = match self.slot_attr(attr(sc.id_attribute)).await? {
                 SlotAttr::NoSlot => break,
                 SlotAttr::Missing => None,
+                // pulled module: the slot remains, its ID reads empty (2026-10-14)
+                SlotAttr::Data(d) if d.is_empty() => Some(0),
                 SlotAttr::Data(d) => le_uint(&d).and_then(|v| u32::try_from(v).ok()),
             };
             let name = match self.slot_attr(attr(sc.name_attribute)).await? {
@@ -493,6 +499,85 @@ impl<S: CipService> Coupler<S> {
                 _ => Err(e.into()),
             },
         }
+    }
+
+    /// Read the coupler diagnosis: status word, latest diagnosis event and unacknowledged
+    /// diagnosis ([`CouplerLayout::diagnosis`]). Needs no configured modules.
+    ///
+    /// Seen on hardware (2026-10-13): while a module was being pulled the unacknowledged
+    /// diagnosis briefly failed with CIP status 0x1F (vendor specific), so this call can
+    /// fail transiently; it answered again about 8 s later.
+    pub async fn diagnosis(&mut self) -> Result<CouplerDiagnosis> {
+        let paths = self
+            .layout
+            .diagnosis
+            .ok_or_else(|| Error::Unsupported("diagnosis disabled in CouplerLayout".into()))?;
+        let status =
+            StatusWord::decode(&self.service.get_attribute_single(paths.status_word).await?)?;
+        let latest_event = self
+            .service
+            .get_attribute_single(paths.latest_event)
+            .await?;
+        let unacknowledged = GatewayDiagnosis::decode(
+            &self
+                .service
+                .get_attribute_single(paths.unacknowledged)
+                .await?,
+        )?;
+        Ok(CouplerDiagnosis {
+            status,
+            unacknowledged,
+            latest_event,
+        })
+    }
+
+    /// Read the module diagnosis and process alarm of slot `position` (1-based) from the
+    /// Slot class. Works for any slot the coupler has, configured in the station or not;
+    /// past the last slot the coupler answers 0x05 (see [`Error::cip_status`]).
+    pub async fn slot_diagnosis(&mut self, position: usize) -> Result<SlotDiagnosis> {
+        let sc = self
+            .layout
+            .slot_class
+            .ok_or_else(|| Error::Unsupported("slot class disabled in CouplerLayout".into()))?;
+        let instance = u32::try_from(position)
+            .ok()
+            .filter(|i| (1..=sc.max_slots).contains(i))
+            .ok_or(Error::NoSuchSlot {
+                position,
+                count: usize::try_from(sc.max_slots).unwrap_or(usize::MAX),
+            })?;
+        let diag = self
+            .service
+            .get_attribute_single(AttributePath::new(
+                sc.class,
+                instance,
+                sc.diagnosis_attribute,
+            ))
+            .await?;
+        let alarm = self
+            .service
+            .get_attribute_single(AttributePath::new(
+                sc.class,
+                instance,
+                sc.process_alarm_attribute,
+            ))
+            .await?;
+        SlotDiagnosis::decode(position, &diag, &alarm)
+    }
+
+    /// [`Coupler::slot_diagnosis`] of every slot, from 1 until the coupler reports no
+    /// further slot.
+    pub async fn slot_diagnoses(&mut self) -> Result<Vec<SlotDiagnosis>> {
+        let max = self.layout.slot_class.map_or(0, |sc| sc.max_slots);
+        let mut out = Vec::new();
+        for position in 1..=usize::try_from(max).unwrap_or(usize::MAX) {
+            match self.slot_diagnosis(position).await {
+                Ok(d) => out.push(d),
+                Err(e) if e.is_no_slot() => break,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(out)
     }
 
     /// Read the module IDs from the Gateway module list.

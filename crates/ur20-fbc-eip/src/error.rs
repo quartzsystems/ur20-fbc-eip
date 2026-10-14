@@ -124,6 +124,20 @@ pub enum Error {
 }
 
 impl Error {
+    /// The CIP status if the coupler rejected a request.
+    pub fn cip_status(&self) -> Option<&ur20_fbc_eip_cip::CipStatus> {
+        match self {
+            Self::Cip(e) => e.cip_status(),
+            _ => None,
+        }
+    }
+
+    /// The coupler said this slot does not exist: CIP status 0x05 (path destination
+    /// unknown, seen on hardware past the last slot) or 0x16 (object does not exist).
+    pub fn is_no_slot(&self) -> bool {
+        matches!(self.cip_status().map(|s| s.general), Some(0x05 | 0x16))
+    }
+
     pub(crate) fn len(context: impl Into<String>, expected: usize, actual: usize) -> Self {
         Self::BufferLength {
             context: context.into(),

@@ -156,3 +156,25 @@ async fn digital_writes_outputs() {
         "explicit write access should lapse after {timeout:?} without traffic"
     );
 }
+
+#[tokio::test]
+#[ignore = "needs hardware: set UR20_EIP_ADDR"]
+async fn diagnosis() {
+    let mut c = Coupler::connect_auto(addr(), CouplerLayout::default())
+        .await
+        .unwrap();
+    let d = c.diagnosis().await.unwrap();
+    println!("{d:?}\nstatus word: {}", d.status);
+    let slots = c.slot_diagnoses().await.unwrap();
+    for s in &slots {
+        println!("{s:?}");
+    }
+    // every slot of the detected station answers, plus none beyond it
+    assert_eq!(slots.len(), c.station().slots().len());
+    let img = c.read_inputs().await.unwrap();
+    assert_eq!(
+        img.status(),
+        Some(d.status),
+        "0x64/1/104 mirrors the 111 header"
+    );
+}

@@ -17,7 +17,7 @@ use std::time::Duration;
 use ur20_fbc_eip::cip::codec::Reader;
 use ur20_fbc_eip::cip::message::{CipStatus, MessageResponse, service};
 use ur20_fbc_eip::cip::{CipService, MessageRequest};
-use ur20_fbc_eip::{ChannelValue, Coupler, CouplerLayout, Error, modules};
+use ur20_fbc_eip::{ChannelValue, Coupler, CouplerLayout, Error, RawBit, modules};
 
 /// Attributes keyed by (class, instance, attribute), all 8-bit path segments.
 #[derive(Default)]
@@ -26,7 +26,44 @@ struct MockCoupler {
     log: Vec<(u8, (u8, u8, u8))>,
 }
 
+/// 0x65/n/116 of a healthy UR20-16DI-P (byte 4 = 0x70) or UR20-16DO-P (0x72), 2026-10-14.
+fn healthy_diagnosis(output: bool) -> Vec<u8> {
+    let mut v = vec![0; 47];
+    v[1] = 0x0f;
+    v[4] = if output { 0x72 } else { 0x70 };
+    v[45] = 0x07;
+    v[46] = 0x09;
+    v
+}
+
 impl MockCoupler {
+    /// What the coupler served with the 16DO pulled from slot 2 (2026-10-14): the slot
+    /// instance remains, name/ID/data/diagnosis read as 0 bytes, the size attributes keep the
+    /// old module's values, the module list entry is 0 and the status word has bit 6.
+    fn pull_slot_2(&mut self) {
+        for a in [101, 104, 113, 114, 116, 117] {
+            self.attrs.insert((0x65, 2, a), vec![]);
+        }
+        self.attrs.insert((0x65, 2, 109), vec![0, 0]);
+        self.attrs.get_mut(&(0x64, 1, 111)).unwrap()[4..8].fill(0);
+        self.attrs.insert((0x64, 1, 104), vec![0x40, 0x00]);
+        self.attrs
+            .insert((0x64, 1, 108), vec![0x02, 0x80, 0x00, 0x0f]);
+        self.attrs.get_mut(&(0x04, 111, 3)).unwrap()[0] = 0x40;
+    }
+
+    /// Uout disconnected (2026-10-14): status word 0x2000, 16DO diagnosis byte 0 = 0x15,
+    /// bytes 43-46 replaced, latest event `02 82 15 0f`.
+    fn uout_off(&mut self) {
+        let d = self.attrs.get_mut(&(0x65, 2, 116)).unwrap();
+        d[0] = 0x15;
+        d[43..].copy_from_slice(&[0x63, 0xae, 0xef, 0x56]);
+        self.attrs.insert((0x64, 1, 104), vec![0x00, 0x20]);
+        self.attrs
+            .insert((0x64, 1, 108), vec![0x02, 0x82, 0x15, 0x0f]);
+        self.attrs.get_mut(&(0x04, 111, 3)).unwrap()[1] = 0x20;
+    }
+
     /// Slot class and gateway attributes as the real coupler serves them (2026-10-13):
     /// 101 = STRING name, 104 = UDINT module ID, 109/110 = UINT bits, 113/114 = data (empty
     /// when the module has no data in that direction). Past the last slot: status 0x05.
@@ -47,10 +84,16 @@ impl MockCoupler {
                 .insert((0x65, slot, 113), vec![0; in_bits.div_ceil(8)]);
             self.attrs
                 .insert((0x65, slot, 114), vec![0; out_bits.div_ceil(8)]);
+            self.attrs
+                .insert((0x65, slot, 116), healthy_diagnosis(*out_bits > 0));
+            self.attrs.insert((0x65, slot, 117), vec![0; 4]);
             list.extend_from_slice(&id.to_le_bytes());
         }
         list.resize(256, 0);
         self.attrs.insert((0x64, 1, 111), list);
+        self.attrs.insert((0x64, 1, 104), vec![0, 0]);
+        self.attrs.insert((0x64, 1, 108), vec![]);
+        self.attrs.insert((0x64, 1, 118), vec![0; 8]);
         self.attrs.insert((0x66, 1, 107), vec![0, 0]);
         self.attrs.insert((0x66, 1, 108), vec![0]);
     }
@@ -470,4 +513,113 @@ async fn output_trailer_is_written_back() {
     img.set(2, 0, ChannelValue::Bit(true)).unwrap();
     c.write_outputs(&img).await.unwrap();
     assert_eq!(c.service_mut().attrs[&(0x04, 112, 3)], [0, 0, 1, 0, 7, 7]);
+}
+
+#[tokio::test]
+async fn coupler_diagnosis_matches_hardware() {
+    let mut c = Coupler::detect(MockCoupler::bench(), CouplerLayout::default())
+        .await
+        .unwrap();
+    let d = c.diagnosis().await.unwrap();
+    assert!(d.is_ok() && d.unacknowledged.is_clear());
+    let slots = c.slot_diagnoses().await.unwrap();
+    assert_eq!(slots.iter().map(|d| d.position).collect::<Vec<_>>(), [1, 2]);
+    assert!(slots.iter().all(|d| d.is_ok()), "{slots:?}");
+    assert_eq!(slots[1].module.unwrap().type_byte(), 0x72);
+
+    c.service_mut().uout_off();
+    let d = c.diagnosis().await.unwrap();
+    assert!(d.status.output_supply_error() && !d.status.module_removed());
+    assert_eq!(d.latest_event, [0x02, 0x82, 0x15, 0x0f]);
+    assert!(d.unacknowledged.is_clear(), "118 stayed zero on hardware");
+    assert_eq!(c.read_inputs().await.unwrap().status(), Some(d.status));
+    assert!(c.slot_diagnosis(1).await.unwrap().is_ok());
+    let s2 = c.slot_diagnosis(2).await.unwrap();
+    assert!(!s2.is_ok() && s2.module.unwrap().output_supply_missing());
+
+    let mut c = Coupler::detect(MockCoupler::bench(), CouplerLayout::default())
+        .await
+        .unwrap();
+    c.service_mut().pull_slot_2();
+    let d = c.diagnosis().await.unwrap();
+    assert!(d.status.module_removed() && !d.status.output_supply_error());
+    let s2 = c.slot_diagnosis(2).await.unwrap();
+    assert!(!s2.is_present() && !s2.is_ok());
+    // the slot still exists, so a full sweep reports it as empty rather than stopping
+    let all = c.slot_diagnoses().await.unwrap();
+    assert_eq!(all.len(), 2);
+    assert!(!all[1].is_present());
+}
+
+#[tokio::test]
+async fn verify_catches_pulled_module() {
+    // Same bit sizes as a 16DO (the coupler keeps 110 = 16), so only the empty ID shows it.
+    let mut mock = MockCoupler::bench();
+    mock.pull_slot_2();
+    let modules = modules::create_all(&["UR20-16DI-P", "UR20-16DO-P"]).unwrap();
+    let mut c = Coupler::new(mock, CouplerLayout::default(), modules).unwrap();
+    let slots = c.discover_slots().await.unwrap();
+    assert_eq!(slots[1].module_id, Some(0));
+    assert_eq!((slots[1].input_bits, slots[1].output_bits), (0, 16));
+    let e = c.verify_station().await.unwrap_err();
+    assert!(
+        matches!(e, Error::StationMismatch { position: 2, .. }),
+        "{e}"
+    );
+    assert!(e.to_string().contains("no module"), "{e}");
+    // and auto-detection sees one module only
+    let mut mock = MockCoupler::bench();
+    mock.pull_slot_2();
+    let c = Coupler::detect(mock, CouplerLayout::default())
+        .await
+        .unwrap();
+    assert_eq!(c.station().slots().len(), 1);
+}
+
+#[tokio::test]
+async fn diagnosis_edge_cases() {
+    let mut c = Coupler::detect(MockCoupler::bench(), CouplerLayout::default())
+        .await
+        .unwrap();
+    // past the last slot: the coupler's own 0x05
+    let e = c.slot_diagnosis(3).await.unwrap_err();
+    assert!(e.is_no_slot(), "{e}");
+    // nonsense slot numbers never reach the coupler
+    let before = c.service_mut().log.len();
+    for bad in [0, 65] {
+        assert!(matches!(
+            c.slot_diagnosis(bad).await,
+            Err(Error::NoSuchSlot { .. })
+        ));
+    }
+    assert_eq!(c.service_mut().log.len(), before);
+    // unnamed bits stay visible as raw bits
+    c.service_mut().attrs.get_mut(&(0x64, 1, 118)).unwrap()[2] = 0b0001_0000;
+    assert_eq!(
+        c.diagnosis().await.unwrap().unacknowledged.set_bits(),
+        [RawBit { byte: 2, bit: 4 }]
+    );
+    c.service_mut().attrs.get_mut(&(0x65, 1, 117)).unwrap()[3] = 0x80;
+    assert!(c.slot_diagnosis(1).await.unwrap().has_process_alarm());
+    // wrong sizes are errors, not panics or silent truncation
+    c.service_mut().attrs.insert((0x64, 1, 118), vec![0; 7]);
+    assert!(matches!(
+        c.diagnosis().await,
+        Err(Error::BufferLength { .. })
+    ));
+    c.service_mut().attrs.insert((0x65, 1, 117), vec![0; 5]);
+    assert!(matches!(
+        c.slot_diagnosis(1).await,
+        Err(Error::BufferLength { .. })
+    ));
+    // other CIP errors propagate (0x1F was seen on 118 while a module was being pulled)
+    c.service_mut().attrs.remove(&(0x64, 1, 118));
+    assert_eq!(
+        c.diagnosis()
+            .await
+            .unwrap_err()
+            .cip_status()
+            .map(|s| s.general),
+        Some(0x14)
+    );
 }

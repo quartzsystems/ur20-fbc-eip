@@ -19,18 +19,29 @@ All notable changes to this workspace are recorded here. The format follows
   `Station::set_outputs`, `Station::encode_slot_outputs`, `Station::encode_outputs`.
 - `ur20eip set-many 2:0=on 2:1=off …`.
 - Hardware test `digital_writes_outputs`, gated by `UR20_EIP_ALLOW_WRITES=1`.
+- Diagnosis (`ur20_fbc_eip::diagnosis`): `Coupler::diagnosis()` → `CouplerDiagnosis`
+  (status word from 0x64/1/104, latest event 0x64/1/108, unacknowledged diagnosis
+  0x64/1/118), `Coupler::slot_diagnosis(slot)` / `slot_diagnoses()` → `SlotDiagnosis`
+  (0x65/n/116 and 117). Named only where confirmed on the bench: `StatusWord::MODULE_REMOVED`
+  (bit 6), `StatusWord::OUTPUT_SUPPLY_ERROR` (bit 13), `ModuleDiagnosis::has_error` /
+  `output_supply_missing` (byte 0); everything else is raw. `InputImage::status()`,
+  `Error::cip_status()`, `Error::is_no_slot()`, `CouplerLayout::diagnosis`, and
+  `SlotClass::diagnosis_attribute` / `process_alarm_attribute`.
+- `ur20eip diag [--slot N] [--raw]`.
 
 ### Changed
 
 - `OutputImage` has a `trailer` field (bytes after the configured modules), which
   `write_outputs` writes back unchanged.
 - The `do_chase` example writes the whole DO module once per step.
-
 - The examples read the coupler address from `UR20_EIP_ADDR` and the module list from
   `UR20_EIP_MODULES`, or detect the modules from the coupler, the same way the CLI does.
 
 ### Fixed
 
+- `verify_station` passed with a module pulled: the coupler keeps the slot and its old bit
+  sizes, so only the module ID shows it. An empty module ID is now reported as 0 (no module)
+  and fails verification.
 - The workspace builds on its declared MSRV (Rust 1.85) again: removed `let` chains, which
   need 1.88.
 

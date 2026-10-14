@@ -75,6 +75,10 @@ pub struct SlotClass {
     pub input_attribute: u16,
     /// Attribute holding the slot's output data.
     pub output_attribute: u16,
+    /// Module diagnosis, 47 bytes (see [`crate::diagnosis`]).
+    pub diagnosis_attribute: u16,
+    /// Process alarm, 4 bytes (see [`crate::diagnosis`]).
+    pub process_alarm_attribute: u16,
     /// Highest slot number.
     pub max_slots: u32,
 }
@@ -90,6 +94,8 @@ impl Default for SlotClass {
             output_bits_attribute: 110,
             input_attribute: 113,
             output_attribute: 114,
+            diagnosis_attribute: 116,
+            process_alarm_attribute: 117,
             max_slots: 64,
         }
     }
@@ -124,6 +130,31 @@ pub struct CouplerLayout {
     /// [`crate::Coupler::detect`]. Default `0x64/1/111` (Gateway class), read from hardware
     /// on 2026-10-13.
     pub module_list: Option<AttributePath>,
+    /// Coupler diagnosis attributes used by [`crate::Coupler::diagnosis`]; `None` to
+    /// disable. See [`crate::diagnosis`].
+    pub diagnosis: Option<DiagnosisPaths>,
+}
+
+/// Gateway class attributes read by [`crate::Coupler::diagnosis`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiagnosisPaths {
+    /// UINT status word, same value as the input assembly header.
+    pub status_word: AttributePath,
+    /// Latest diagnosis event, 4 bytes, empty when none is active.
+    pub latest_event: AttributePath,
+    /// Unacknowledged diagnosis, 8 bytes.
+    pub unacknowledged: AttributePath,
+}
+
+impl Default for DiagnosisPaths {
+    /// `0x64/1/104`, `108` and `118`, read from hardware on 2026-10-13/14.
+    fn default() -> Self {
+        Self {
+            status_word: AttributePath::new(0x64, 1, 104),
+            latest_event: AttributePath::new(0x64, 1, 108),
+            unacknowledged: AttributePath::new(0x64, 1, 118),
+        }
+    }
 }
 
 impl Default for CouplerLayout {
@@ -145,6 +176,7 @@ impl CouplerLayout {
             explicit_write: Some(ExplicitWriteControl::default()),
             slot_class: Some(SlotClass::default()),
             module_list: Some(AttributePath::new(0x64, 1, 111)),
+            diagnosis: Some(DiagnosisPaths::default()),
         }
     }
 

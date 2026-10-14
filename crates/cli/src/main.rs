@@ -4,6 +4,7 @@
 
 //! `ur20eip`: bring-up tool for the Weidmüller UR20-FBC-EIP EtherNet/IP coupler.
 
+mod diag;
 mod parse;
 mod raw;
 mod station;
@@ -14,6 +15,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
+use ur20_fbc_eip::{Coupler, CouplerLayout};
 use ur20_fbc_eip_cip::{CipService, Client, ConnectionParams};
 
 /// Talk to a Weidmüller u-remote UR20-FBC-EIP coupler over EtherNet/IP.
@@ -90,6 +92,17 @@ enum Command {
         #[command(flatten)]
         write: station::WriteArgs,
     },
+    /// Coupler status word, coupler diagnosis (0x64/1/118) and per-slot diagnosis
+    /// (0x65/n/116, 117). Only bits confirmed on hardware are named; see the
+    /// `ur20_fbc_eip::diagnosis` docs.
+    Diag {
+        /// Only these slots (repeatable). Default: every slot the coupler has.
+        #[arg(long = "slot", value_name = "N")]
+        slots: Vec<usize>,
+        /// Also print the raw 47-byte diagnosis of healthy modules.
+        #[arg(long)]
+        raw: bool,
+    },
     /// Arbitrary class/instance/attribute access.
     #[command(subcommand)]
     Raw(raw::RawCommand),
@@ -142,6 +155,12 @@ async fn main() -> Result<()> {
         Command::Identity => identity(&mut client).await,
         Command::Raw(cmd) => raw::run(&mut client, cmd).await,
         Command::Slots => return station::slots(client).await,
+        Command::Diag { slots, raw } => {
+            let mut coupler = Coupler::new(client, CouplerLayout::default(), Vec::new())?;
+            let r = diag::run(&mut coupler, slots, *raw).await;
+            client = coupler.into_inner();
+            r
+        }
         Command::DumpInputs { station, raw } => {
             let mut coupler = station.coupler(client).await?;
             let r = station::dump_inputs(&mut coupler, *raw).await;
@@ -239,6 +258,8 @@ mod tests {
         for args in [
             &["identity"][..],
             &["slots"],
+            &["diag"],
+            &["diag", "--slot", "2", "--slot", "1", "--raw"],
             &["dump-inputs", "--raw"],
             &["dump-outputs", "-m", "UR20-16DI-P,UR20-16DO-P"],
             &["watch", "-i", "100ms"],

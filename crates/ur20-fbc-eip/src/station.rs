@@ -29,7 +29,9 @@ pub struct Slot {
 pub struct SlotInfo {
     /// Slot number (1-based).
     pub position: usize,
-    /// Module ID (attribute 104), if the coupler provides it.
+    /// Module ID (attribute 104), if the coupler provides it. `Some(0)` if the slot is
+    /// empty: with a module pulled the coupler keeps the slot but its ID reads as 0 bytes
+    /// (and the output size stays at the old module's value).
     pub module_id: Option<u32>,
     /// Module name (attribute 101), if the coupler provides it.
     pub name: Option<String>,
@@ -294,10 +296,11 @@ impl Station {
         for (slot, r) in self.slots.iter().zip(reported) {
             let expected = slot.module.descriptor();
             if let Some(id) = r.module_id.filter(|id| *id != expected.id) {
-                let actual = r
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| format!("module {id:#010x}"));
+                let actual = match (id, &r.name) {
+                    (0, _) => "no module (pulled?)".to_owned(),
+                    (_, Some(name)) => name.clone(),
+                    (_, None) => format!("module {id:#010x}"),
+                };
                 return Err(Error::StationMismatch {
                     position: slot.position,
                     detail: format!("configured {}, coupler has {actual}", expected.name),

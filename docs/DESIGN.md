@@ -65,18 +65,22 @@ Source: *QSG0028v3 UR20-FBC-EIP Quick Start Guide – MicroLogix 1400*, ch. 3, a
 | Slot | 0x65 | 1…64 | 113 / 114 | per-module process data in / out (empty if none) |
 | Slot | 0x65 | 1…64 | 101 / 104 | module name (STRING) / module ID (UDINT) ✔ |
 | Slot | 0x65 | 1…64 | 109 / 110 | input / output size in bits (UINT) ✔ |
-| Slot | 0x65 | 1…64 | 116 / 117 | 47 diagnostic bytes / 4 process-alarm bytes ✔ |
+| Slot | 0x65 | 1…64 | 116 / 117 | 47 diagnostic bytes / 4 process-alarm bytes, 0 bytes if the module is pulled ✔ |
 | Process Data | 0x66 | 1 | 101 / 103 | packed data in / out, no header |
 | Process Data | 0x66 | 1 | 107 (WORD) | explicit-write timeout in s |
 | Process Data | 0x66 | 1 | 108 (BOOL) | "Start Explicit Process Data Exchange" |
 | Gateway | 0x64 | 1 | 101… | coupler identity/status/params (101 = HW version) |
+| Gateway | 0x64 | 1 | 104 | status word, same value as the 111 header ✔ |
+| Gateway | 0x64 | 1 | 108 | latest diagnosis event, 4 bytes; empty when none is active ✔ |
 | Gateway | 0x64 | 1 | 111 | 64 × UDINT module IDs, slot 1 first, 0 = empty ✔ |
-| Gateway | 0x64 | 1 | 118 | 8 bytes unacknowledged diagnosis ✔ |
+| Gateway | 0x64 | 1 | 118 | 8 bytes unacknowledged diagnosis ✔ (no bit seen set yet) |
 | Module Params | 0x67 | 1…64 | 101… | per-module parameters |
 
 ✔ = read from hardware, not in the QSG. Attribute 100 of each instance holds its highest
 attribute number. Past the last slot the coupler answers 0x05 (path destination unknown);
-Get_Attributes_All on class 0x65 is not supported (0x08).
+Get_Attributes_All on class 0x65 is not supported (0x08). With a module pulled, its slot
+instance stays: name, ID, data and diagnosis read as 0 bytes, but 109/110 keep the old sizes.
+The diagnosis bits are documented in `ur20_fbc_eip::diagnosis`.
 
 The input header is the **coupler status word** (AN0050 §5.3). Hardware confirms 2-byte
 headers on **both** 111 and 112 (each 4 bytes with one 16DI and one 16DO).
@@ -87,7 +91,9 @@ and that is refused while a PLC holds an Exclusive Owner connection. `Coupler` e
 
 Still marked `TODO-verify-on-hardware` in code (and listed in §7):
 * bit order of 16-channel modules (needs a live signal) and byte order of 16-bit analog data;
-* status word and output header bit meanings (both read 0x0000 on a healthy station);
+* status word bits other than 6 (module removed) and 13 (output supply error), and the
+  output header (0x0000 in every state seen);
+* most of the 47-byte module diagnosis, 0x64/1/108 and all of 0x64/1/118 (see §7);
 * where the 8 diagnostic bytes sit in 113/114 (assumed after process data);
 * UR20-2CNT-100 process data layout.
 
@@ -148,6 +154,9 @@ let mut out = cpl.read_outputs().await?;         // OutputImage { header, slots,
 out.set(2, 3, Bit(true))?;                       // edit locally, nothing sent
 cpl.write_outputs(&out).await?;                  // one write, no read; header/trailer kept
 let slots = cpl.discover_slots().await?;         // class 0x65 → SlotInfo { id, name, bits }
+let d = cpl.diagnosis().await?;                  // CouplerDiagnosis { status: StatusWord, … }
+d.status.output_supply_error();                  // named only where confirmed on hardware
+let s = cpl.slot_diagnosis(2).await?;            // SlotDiagnosis { module: Option<ModuleDiagnosis>, … }
 cpl.verify_station().await?;                     // ID or size mismatch → Err
 ```
 
@@ -169,6 +178,7 @@ ur20eip [--addr IP[:PORT] | $UR20_EIP_ADDR] [--timeout-ms N] [--connected]
                                              read-modify-write one output channel
   set-many <slot:ch=value>… --modules … [--write-timeout 5s] [--no-enable]
                                              several channels, one read + one write
+  diag [--slot N]… [--raw]                   status word, coupler and slot diagnosis
   raw get     <class> <instance> <attr>
   raw get-all <class> <instance>
   raw set     <class> <instance> <attr> <hex-bytes>
@@ -198,7 +208,9 @@ Answered on 2026-10-13 (station: UR20-16DI-P, UR20-16DO-P; all signals off), rea
 Still open:
 
 7. Analog byte order and 2CNT-100 layout: need those modules on the station.
-8. Status word bits other than bit 6.
+8. Status word bits other than 6 and 13; the rest of the module diagnosis; 0x64/1/118,
+   which no fault has set so far (candidates: a short circuit on a DO, a wire break on a
+   DIAG module, a parameter error).
 
 Answered with signals on the bench (2026-10-13):
 
@@ -209,3 +221,25 @@ Answered with signals on the bench (2026-10-13):
 * ✔ Module pulled (16DO, slot 2): status word 0x0000 → 0x0040; module list entry 2 → 0;
   0x64/1/118 briefly failed with 0x1F (vendor specific); identity status stayed 0x0034;
   DI data kept updating. All recovered about 8 s later.
+
+Diagnosis experiments (2026-10-14, read-only, `ur20eip raw get` snapshots before, twice
+during, and after each fault):
+
+* ✔ **Uout disconnected** (web server: "Output power supply error" on the coupler): status
+  word and 0x64/1/104 `0x0000 → 0x2000` (bit 13); 16DO diagnosis byte 0 `00 → 15`, bytes
+  43–46 `00 00 07 09 → 63 ae ef 56`; 0x64/1/108 empty → `02 82 15 0f`. 16DI (on Uin)
+  unchanged. Stable for 20 s. After Uout returned everything cleared without any
+  acknowledgement, except bytes 43–46, which took another new value (`6a 70 39 a3`).
+* ✔ **16DO pulled from slot 2** (web: "Module removed", "Configuration Mismatch",
+  "EIPModMismatch"): status word `0x0040` (bit 6, as on 2026-10-13); 0x64/1/104 `40 00`;
+  module list entry 2 → 0; slot 2 101/104/113/114/116/117 → 0 bytes, 109/110 → 0/16;
+  0x64/1/108 `02 80 00 0f`; slot 3 still 0x05. Everything cleared after re-insertion; the
+  new module's bytes 43–46 read `00 00 07 09` again (power-up value).
+* In both: 0x64/1/118 stayed `00 × 8`, process alarms stayed zero, identity status 0x0034.
+  "EIPNoConnection" is always shown while no PLC holds a class 1 connection.
+* Found and fixed by this: `verify_station` passed with the 16DO pulled (no ID to compare,
+  and 0/16 bits still matched). An empty module ID now reads as 0 = no module.
+* Healthy module diagnosis is **not** all zeros: byte 1 = `0f`; byte 4 = `70` (16DI) /
+  `72` (16DO). Together with byte 0 = `15` on Uout loss, this fits the S7 DS0/DS1 record
+  layout (module fault / external fault / missing auxiliary voltage; channel type 70/72).
+  That is a hypothesis; only the observed bits are named in code.

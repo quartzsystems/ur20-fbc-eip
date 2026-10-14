@@ -38,6 +38,7 @@
 )]
 
 pub mod coupler;
+pub mod diagnosis;
 pub mod error;
 pub mod layout;
 pub mod module;
@@ -45,8 +46,11 @@ pub mod modules;
 pub mod station;
 
 pub use coupler::{Coupler, InputImage, OutputImage};
+pub use diagnosis::{
+    CouplerDiagnosis, GatewayDiagnosis, ModuleDiagnosis, RawBit, SlotDiagnosis, StatusWord,
+};
 pub use error::{Error, Result};
-pub use layout::{CouplerLayout, ImageFormat};
+pub use layout::{CouplerLayout, DiagnosisPaths, ImageFormat};
 pub use module::{Category, ChannelValue, Module, ModuleDescriptor, ValueKind};
 pub use station::{Slot, SlotInfo, SlotValues, Station};
 pub use ur20_fbc_eip_cip as cip;
