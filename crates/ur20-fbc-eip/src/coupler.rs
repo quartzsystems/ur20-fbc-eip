@@ -9,7 +9,10 @@ use std::time::Duration;
 use tokio::net::ToSocketAddrs;
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
-use ur20_fbc_eip_cip::{AttributePath, CipService, Client, Identity};
+use ur20_fbc_eip_cip::{
+    AttributePath, CipService, Client, ConnectionParams, Identity, ImplicitConnection,
+    ImplicitOptions, ImplicitState, InputFrame,
+};
 
 use crate::diagnosis::{CouplerDiagnosis, GatewayDiagnosis, SlotDiagnosis, StatusWord};
 use crate::error::{Error, Result};
@@ -149,6 +152,16 @@ pub struct Coupler<S = Client> {
     access_gap: bool,
     /// Warned once about writing without requested access.
     warned_no_access: bool,
+    /// Open class 1 connection, see [`Coupler::open_implicit`].
+    implicit: Option<Implicit>,
+}
+
+/// A class 1 connection owned by the coupler, plus our own cursor into its inputs.
+#[derive(Debug)]
+struct Implicit {
+    conn: ImplicitConnection,
+    inputs: tokio::sync::watch::Receiver<Option<InputFrame>>,
+    state: tokio::sync::watch::Receiver<ImplicitState>,
 }
 
 impl Coupler<Client> {
@@ -175,11 +188,15 @@ impl Coupler<Client> {
 
     /// Replace the TCP connection and session ([`Client::reconnect`]), keeping the layout and
     /// station. A class 3 connection is re-opened if one was open, and explicit write access
-    /// is requested again if [`Coupler::enable_explicit_outputs`] was called.
+    /// is requested again if [`Coupler::enable_explicit_outputs`] was called. A class 1
+    /// connection is dropped (its task stops, the coupler times it out); open a new one.
     ///
     /// On error the coupler is unchanged and the call can be retried.
     pub async fn reconnect(&mut self) -> Result<()> {
         self.service.reconnect().await?;
+        if self.implicit.take().is_some() {
+            info!("class 1 connection dropped by reconnect");
+        }
         info!(peer = %self.service.peer_addr(), "reconnected");
         if let Some(timeout) = self.explicit_timeout {
             self.write_explicit_enable(timeout).await?;
@@ -188,10 +205,79 @@ impl Coupler<Client> {
         Ok(())
     }
 
-    /// Close the session ([`Client::close`]). Dropping the coupler instead only sends a
-    /// best-effort UnRegisterSession.
-    pub async fn close(self) -> Result<()> {
+    /// Close the class 1 connection, if any, and the session ([`Client::close`]). Dropping the
+    /// coupler instead only sends a best-effort UnRegisterSession.
+    pub async fn close(mut self) -> Result<()> {
+        if let Err(e) = self.close_implicit().await {
+            debug!(error = %e, "closing class 1 connection");
+        }
         Ok(self.service.close().await?)
+    }
+
+    /// Open a class 1 ("Exclusive Owner") connection to the layout's assemblies over this
+    /// session, with requested packet interval `rpi`.
+    ///
+    /// The sizes are taken from one explicit read of each assembly and checked against the
+    /// station first, so a wrong module list fails here with [`Error::StationMismatch`].
+    /// Outputs start as zeros in idle mode (unless [`ImplicitOptions::run`]); set them with
+    /// the usual output methods and switch to run with [`Coupler::set_implicit_run`].
+    ///
+    /// While the connection is open, output writes go into the next O→T packet instead of
+    /// explicit messages: [`Coupler::set_output`], [`Coupler::set_outputs`],
+    /// [`Coupler::write_slot_outputs`] and [`Coupler::write_outputs`] change the O→T image,
+    /// and [`Coupler::read_outputs`] returns it. [`Coupler::write_output_assembly`] and
+    /// [`Coupler::enable_explicit_outputs`] fail with [`Error::ImplicitOpen`]. Explicit reads
+    /// keep working.
+    pub async fn open_implicit(&mut self, rpi: Duration, options: ImplicitOptions) -> Result<()> {
+        if self.implicit.is_some() {
+            return Err(Error::ImplicitOpen("close it before opening another"));
+        }
+        let config = self.layout.config_instance.ok_or_else(|| {
+            Error::Unsupported("class 1 needs CouplerLayout::config_instance".into())
+        })?;
+        let in_len = self.read_input_assembly().await?.len();
+        let out_len = self.read_output_assembly().await?.len();
+        let expected_in = self.layout.input_header_len + self.station.input_len();
+        let expected_out = self.layout.output_header_len + self.station.output_len();
+        if in_len < expected_in || out_len < expected_out {
+            return Err(Error::StationMismatch {
+                position: 0,
+                detail: format!(
+                    "assemblies are {in_len}/{out_len} bytes in/out, the configured station \
+                     needs {expected_in}/{expected_out}"
+                ),
+            });
+        }
+        let size = |n: usize| {
+            u16::try_from(n).map_err(|_| Error::Unsupported(format!("{n}-byte assembly")))
+        };
+        let params = ConnectionParams::implicit_class1(
+            config,
+            self.layout.output.instance,
+            self.layout.input.instance,
+            size(out_len)?,
+            size(in_len)?,
+            rpi,
+        );
+        // The coupler refuses explicit write access while class 1 owns the outputs.
+        self.explicit_timeout = None;
+        let conn = ImplicitConnection::open(&mut self.service, params, options).await?;
+        info!(?rpi, in_len, out_len, "class 1 connection open");
+        self.implicit = Some(Implicit {
+            inputs: conn.inputs(),
+            state: conn.state(),
+            conn,
+        });
+        Ok(())
+    }
+
+    /// Close the class 1 connection (Forward_Close), if one is open. Output methods go back
+    /// to explicit messaging.
+    pub async fn close_implicit(&mut self) -> Result<()> {
+        match self.implicit.take() {
+            Some(i) => Ok(i.conn.close(&mut self.service).await?),
+            None => Ok(()),
+        }
     }
 }
 
@@ -271,6 +357,7 @@ impl<S: CipService> Coupler<S> {
             last_request: None,
             access_gap: false,
             warned_no_access: false,
+            implicit: None,
         })
     }
 
@@ -303,6 +390,67 @@ impl<S: CipService> Coupler<S> {
     async fn set(&mut self, path: AttributePath, data: &[u8]) -> Result<()> {
         let r = self.service.set_attribute_single(path, data).await;
         self.track(r)
+    }
+
+    /// The open class 1 connection, for its state, counters and raw data.
+    pub fn implicit(&self) -> Option<&ImplicitConnection> {
+        self.implicit.as_ref().map(|i| &i.conn)
+    }
+
+    fn running_implicit(&self) -> Result<&Implicit> {
+        let i = self
+            .implicit
+            .as_ref()
+            .ok_or_else(|| Error::ImplicitNotRunning("none open".into()))?;
+        let state = i.conn.current_state();
+        if state.is_finished() {
+            return Err(Error::ImplicitNotRunning(format!("{state:?}")));
+        }
+        Ok(i)
+    }
+
+    /// The latest class 1 input frame, decoded; `None` before the first one arrives.
+    pub fn implicit_inputs(&self) -> Result<Option<InputImage>> {
+        let i = self.running_implicit()?;
+        let frame = i.conn.latest_input();
+        frame
+            .map(|f| self.decode_input_assembly(&f.data))
+            .transpose()
+    }
+
+    /// Wait for the next class 1 input frame that this coupler has not returned yet, and
+    /// decode it. Fails with [`Error::ImplicitNotRunning`] when the connection ends.
+    pub async fn next_implicit_inputs(&mut self) -> Result<InputImage> {
+        self.running_implicit()?;
+        let Some(i) = self.implicit.as_mut() else {
+            return Err(Error::ImplicitNotRunning("none open".into()));
+        };
+        let data = loop {
+            tokio::select! {
+                r = i.inputs.changed() => {
+                    if r.is_err() {
+                        // The task publishes its final state before it drops the inputs
+                        // sender, so the state says why it ended.
+                        let state = format!("{:?}", i.conn.current_state());
+                        return Err(Error::ImplicitNotRunning(state));
+                    }
+                    if let Some(f) = i.inputs.borrow_and_update().as_ref() {
+                        break f.data.clone();
+                    }
+                }
+                s = i.state.wait_for(ImplicitState::is_finished) => {
+                    let state = s.map(|s| format!("{:?}", *s)).unwrap_or_else(|_| "task gone".into());
+                    return Err(Error::ImplicitNotRunning(state));
+                }
+            }
+        };
+        self.decode_input_assembly(&data)
+    }
+
+    /// Switch the class 1 connection between run (outputs applied) and idle.
+    pub fn set_implicit_run(&self, run: bool) -> Result<()> {
+        self.running_implicit()?.conn.set_run(run);
+        Ok(())
     }
 
     /// Time since the device last answered a request sent through this coupler.
@@ -351,6 +499,11 @@ impl<S: CipService> Coupler<S> {
     /// Requires explicit write access, see [`Coupler::enable_explicit_outputs`]; re-asserts
     /// it first if it may have lapsed ([`Coupler::keep_explicit_outputs_alive`]).
     pub async fn write_output_assembly(&mut self, data: &[u8]) -> Result<()> {
+        if self.implicit.is_some() {
+            return Err(Error::ImplicitOpen(
+                "explicit output writes would be ignored",
+            ));
+        }
         self.keep_explicit_outputs_alive().await?;
         if self.layout.explicit_write.is_some()
             && self.explicit_timeout.is_none()
@@ -420,8 +573,12 @@ impl<S: CipService> Coupler<S> {
         Ok(data)
     }
 
-    /// Read and decode the output assembly.
+    /// Read and decode the output assembly. With a class 1 connection open this is the O→T
+    /// image being sent (no request).
     pub async fn read_outputs(&mut self) -> Result<OutputImage> {
+        if let Some(i) = &self.implicit {
+            return self.decode_output_assembly(&i.conn.outputs().0);
+        }
         let data = self.read_output_assembly().await?;
         self.decode_output_assembly(&data)
     }
@@ -433,6 +590,9 @@ impl<S: CipService> Coupler<S> {
     pub async fn write_outputs(&mut self, image: &OutputImage) -> Result<()> {
         let data = self.encode_output_assembly(image)?;
         debug!(bytes = data.len(), "writing output image");
+        if let Some(i) = &self.implicit {
+            return Ok(i.conn.set_outputs(&data)?);
+        }
         self.write_output_assembly(&data).await
     }
 
@@ -444,6 +604,11 @@ impl<S: CipService> Coupler<S> {
     /// request arrives within `timeout`. This coupler keeps it alive across idle periods; see
     /// the [type docs](Coupler#explicit-write-access).
     pub async fn enable_explicit_outputs(&mut self, timeout: Duration) -> Result<()> {
+        if self.implicit.is_some() {
+            return Err(Error::ImplicitOpen(
+                "the coupler refuses explicit write access",
+            ));
+        }
         let secs = timeout.as_secs() + u64::from(timeout.subsec_nanos() > 0);
         let secs = u16::try_from(secs).unwrap_or(u16::MAX);
         let timeout = Duration::from_secs(u64::from(secs));
@@ -553,11 +718,21 @@ impl<S: CipService> Coupler<S> {
         .await
     }
 
-    /// Read the output assembly, let `change` edit the module data, write it back.
+    /// Read the output assembly, let `change` edit the module data, write it back. With a
+    /// class 1 connection open: the same on the O→T image, no requests.
     async fn modify_outputs(
         &mut self,
         change: impl FnOnce(&Station, &mut [u8]) -> Result<()>,
     ) -> Result<()> {
+        if let Some(i) = &self.implicit {
+            let mut data = i.conn.outputs().0;
+            let header_len = self.layout.output_header_len;
+            let modules = data
+                .get_mut(header_len..)
+                .ok_or_else(|| Error::len("O→T image header", header_len, 0))?;
+            change(&self.station, modules)?;
+            return Ok(i.conn.set_outputs(&data)?);
+        }
         // Before the read: the read itself counts as traffic and would hide a lapse.
         self.keep_explicit_outputs_alive().await?;
         let mut data = self.read_output_assembly().await?;

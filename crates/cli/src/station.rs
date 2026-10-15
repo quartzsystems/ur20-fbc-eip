@@ -2,14 +2,14 @@
 // licensed under the terms of the MIT license which can be found in the
 // root directory of this project.
 
-//! Commands that use the module layer: slots, dump-inputs, watch, set.
+//! Commands that use the module layer: slots, dump-inputs, watch, set, io.
 
 use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Args;
-use ur20_fbc_eip::cip::{Client, hex};
+use ur20_fbc_eip::cip::{Client, ImplicitOptions, hex};
 use ur20_fbc_eip::{ChannelValue, Coupler, CouplerLayout, InputImage, modules};
 
 use crate::parse;
@@ -226,8 +226,7 @@ pub async fn watch(coupler: &mut Coupler<Client>, args: &WatchArgs) -> Result<()
             i
         });
 
-    let mut last: HashMap<(usize, usize), ChannelValue> = HashMap::new();
-    let mut last_status = None;
+    let mut changes = Changes::default();
     let mut ticker = tokio::time::interval(args.interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -254,17 +253,31 @@ pub async fn watch(coupler: &mut Coupler<Client>, args: &WatchArgs) -> Result<()
             }
             Err(e) => return Err(e.into()),
         };
-        if img.status_word != last_status {
+        changes.print(t, img);
+    }
+}
+
+/// Prints the status word and input channels when they change.
+#[derive(Default)]
+struct Changes {
+    last: HashMap<(usize, usize), ChannelValue>,
+    last_status: Option<u16>,
+}
+
+impl Changes {
+    fn print(&mut self, t: f64, img: InputImage) {
+        if img.status_word != self.last_status {
             if let Some(s) = img.status() {
                 println!("{t:>9.3}s status word {s}");
             }
-            last_status = img.status_word;
+            self.last_status = img.status_word;
         }
         for slot in img.slots {
             for (ch, value) in slot.values.into_iter().enumerate() {
                 let key = (slot.position, ch);
-                if last.get(&key) != Some(&value) {
-                    let was = last
+                if self.last.get(&key) != Some(&value) {
+                    let was = self
+                        .last
                         .get(&key)
                         .map(|v| format!(" (was {v})"))
                         .unwrap_or_default();
@@ -272,9 +285,137 @@ pub async fn watch(coupler: &mut Coupler<Client>, args: &WatchArgs) -> Result<()
                         "{t:>9.3}s slot {:>2} {:<18} ch {ch:>2} = {value}{was}",
                         slot.position, slot.module
                     );
-                    last.insert(key, value);
+                    self.last.insert(key, value);
                 }
             }
+        }
+    }
+}
+
+/// Parse `slot:channel=value` changes for the channels' types.
+fn typed_changes(
+    coupler: &Coupler<Client>,
+    changes: &[parse::Assignment],
+) -> Result<Vec<(usize, usize, ChannelValue)>> {
+    changes
+        .iter()
+        .map(|a| {
+            let module = &coupler.station().slot(a.slot)?.module;
+            let kind = module.output_kind(a.channel).with_context(|| {
+                format!(
+                    "{} in slot {} has {} output channel(s)",
+                    module.name(),
+                    a.slot,
+                    module.output_channels()
+                )
+            })?;
+            Ok((a.slot, a.channel, ChannelValue::parse(&a.value, kind)?))
+        })
+        .collect()
+}
+
+/// Options of `ur20eip io`.
+#[derive(Debug, Args)]
+pub struct IoArgs {
+    /// Requested packet interval, both directions.
+    #[arg(long, default_value = "20ms", value_parser = parse::duration)]
+    pub rpi: Duration,
+
+    /// Output changes as slot:channel=value, put into the O→T image before the loop starts.
+    #[arg(long = "set", value_name = "SLOT:CH=VALUE", value_parser = parse::assignment)]
+    pub set: Vec<parse::Assignment>,
+
+    /// Send in run mode, so the coupler applies the outputs. Without it the connection
+    /// stays idle: outputs are sent but not applied.
+    #[arg(long)]
+    pub run: bool,
+
+    /// Stop after this long instead of waiting for Ctrl-C.
+    #[arg(long, value_parser = parse::duration)]
+    pub duration: Option<Duration>,
+
+    /// Local UDP port for T→O data (the coupler is told if it is not 2222).
+    #[arg(long, default_value_t = 2222)]
+    pub local_port: u16,
+
+    /// T→O data starts with a run/idle header (try if inputs look shifted by 4 bytes).
+    #[arg(long)]
+    pub t_o_run_idle: bool,
+}
+
+/// `ur20eip io`: class 1 connection, print input changes, optionally drive outputs.
+pub async fn io(coupler: &mut Coupler<Client>, args: &IoArgs) -> Result<()> {
+    let changes = typed_changes(coupler, &args.set)?;
+    let options = ImplicitOptions {
+        local_port: args.local_port,
+        t_o_run_idle: args.t_o_run_idle,
+        run: false,
+    };
+    coupler
+        .open_implicit(args.rpi, options)
+        .await
+        .context("opening the class 1 connection (a PLC connected? wrong module list?)")?;
+    if let Some(io) = coupler.implicit() {
+        let r = io.reply();
+        println!(
+            "class 1 open: RPI {:?}, actual O→T {:?} / T→O {:?}, timeout {:?}, {} → {}, \
+             {}/{} bytes out/in",
+            args.rpi,
+            r.o_t_api,
+            r.t_o_api,
+            io.timeout(),
+            io.local_addr(),
+            io.o_t_addr(),
+            io.output_len(),
+            io.input_len()
+        );
+    }
+    let result = io_loop(coupler, args, &changes).await;
+    if let Some(io) = coupler.implicit() {
+        println!("state {:?}, {:?}", io.current_state(), io.counters());
+    }
+    if let Err(e) = coupler.close_implicit().await {
+        println!("Forward_Close: {e}");
+    }
+    result
+}
+
+async fn io_loop(
+    coupler: &mut Coupler<Client>,
+    args: &IoArgs,
+    changes: &[(usize, usize, ChannelValue)],
+) -> Result<()> {
+    coupler.set_outputs(changes).await?;
+    for (slot, channel, value) in changes {
+        println!("O→T slot {slot} channel {channel} = {value}");
+    }
+    coupler.set_implicit_run(args.run)?;
+    println!(
+        "mode: {}",
+        if args.run {
+            "run"
+        } else {
+            "idle (outputs not applied)"
+        }
+    );
+
+    let start = tokio::time::Instant::now();
+    let stop = async {
+        match args.duration {
+            Some(d) => tokio::time::sleep(d).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(stop);
+    let mut printer = Changes::default();
+    loop {
+        tokio::select! {
+            r = coupler.next_implicit_inputs() => {
+                let img = r?;
+                printer.print(start.elapsed().as_secs_f64(), img);
+            }
+            _ = &mut stop => return Ok(()),
+            _ = tokio::signal::ctrl_c() => return Ok(()),
         }
     }
 }
@@ -298,21 +439,7 @@ pub async fn set(
     changes: &[parse::Assignment],
     write: &WriteArgs,
 ) -> Result<()> {
-    let changes = changes
-        .iter()
-        .map(|a| {
-            let module = &coupler.station().slot(a.slot)?.module;
-            let kind = module.output_kind(a.channel).with_context(|| {
-                format!(
-                    "{} in slot {} has {} output channel(s)",
-                    module.name(),
-                    a.slot,
-                    module.output_channels()
-                )
-            })?;
-            Ok((a.slot, a.channel, ChannelValue::parse(&a.value, kind)?))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let changes = typed_changes(coupler, changes)?;
     if !write.no_enable {
         coupler
             .enable_explicit_outputs(write.write_timeout)

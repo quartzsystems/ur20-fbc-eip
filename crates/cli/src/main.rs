@@ -102,6 +102,15 @@ enum Command {
         #[arg(long)]
         raw: bool,
     },
+    /// Open a class 1 (implicit I/O) connection and print input changes. Ctrl-C to stop.
+    ///
+    /// Outputs are sent in idle mode unless --run is given.
+    Io {
+        #[command(flatten)]
+        station: station::StationArgs,
+        #[command(flatten)]
+        io: station::IoArgs,
+    },
     /// Arbitrary class/instance/attribute access.
     #[command(subcommand)]
     Raw(raw::RawCommand),
@@ -114,7 +123,8 @@ impl Cli {
             | Command::DumpOutputs { station }
             | Command::Watch { station, .. }
             | Command::Set { station, .. }
-            | Command::SetMany { station, .. } => Some(station),
+            | Command::SetMany { station, .. }
+            | Command::Io { station, .. } => Some(station),
             _ => None,
         }
     }
@@ -195,6 +205,12 @@ async fn main() -> Result<()> {
             client = coupler.into_inner();
             r
         }
+        Command::Io { station, io } => {
+            let mut coupler = station.coupler(client).await?;
+            let r = station::io(&mut coupler, io).await;
+            client = coupler.into_inner();
+            r
+        }
         Command::SetMany {
             outputs,
             station,
@@ -263,6 +279,20 @@ mod tests {
             &["dump-outputs", "-m", "UR20-16DI-P,UR20-16DO-P"],
             &["watch", "-i", "100ms"],
             &["watch", "-i", "10s", "--reconnect", "--write-access", "2s"],
+            &["io"],
+            &[
+                "io",
+                "--rpi",
+                "10ms",
+                "--set",
+                "2:8=on",
+                "--set",
+                "2:0=1",
+                "--run",
+                "--duration",
+                "5s",
+            ],
+            &["io", "--local-port", "0", "--t-o-run-idle"],
             &["set", "2", "8", "on", "--write-timeout", "5s"],
             &["set-many", "2:0=on", "2:15=off", "--no-enable"],
             &["raw", "get", "0x04", "111", "3"],

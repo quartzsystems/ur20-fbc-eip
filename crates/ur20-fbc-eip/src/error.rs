@@ -118,6 +118,15 @@ pub enum Error {
         detail: String,
     },
 
+    /// The operation needs explicit messaging to the outputs, but a class 1 connection owns
+    /// them (see [`crate::Coupler::open_implicit`]).
+    #[error("a class 1 connection owns the outputs; {0}")]
+    ImplicitOpen(&'static str),
+
+    /// No class 1 connection is open, or it has ended (timed out, failed, closed).
+    #[error("class 1 connection not running: {0}")]
+    ImplicitNotRunning(String),
+
     /// Feature not available with the current layout.
     #[error("not supported: {0}")]
     Unsupported(String),

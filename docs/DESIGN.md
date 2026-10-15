@@ -166,7 +166,20 @@ io.close(&mut client).await?;          // stop task + Forward_Close; drop only s
 * Both sequence numbers advance with every O→T packet.
 * A multicast T→O group from the reply is joined. That is not tried on hardware.
 
-Phase 3 design notes (collected while doing phases 1–2; M1 above follows them):
+**Phase 3, M2 (implemented, mock-tested only):** the `Coupler` owns the class 1
+connection, so the output methods can route into it. While it is open:
+
+* `set_output`, `set_outputs`, `write_slot_outputs` and `write_outputs` edit the O→T image
+  and send no request; `read_outputs` returns that image.
+* `write_output_assembly` and `enable_explicit_outputs` fail with `Error::ImplicitOpen`,
+  because the coupler would ignore explicit output writes anyway.
+* Explicit reads keep working.
+* `reconnect` drops the class 1 connection; `close` closes it.
+
+The CLI's `ur20eip io` opens a connection, prints input changes and can drive outputs with
+`--set … --run`.
+
+Phase 3 design notes (collected while doing phases 1–2; M1 and M2 follow them):
 
 * **Forward_Open for "Exclusive Owner Unpacked":** path `20 04 24 01 2C 70 2C 6F`
   (configuration instance 1, O→T point 112, T→O point 111; §7 item 4). O→T size = 112 length
@@ -236,6 +249,14 @@ cpl.verify_station().await?;                     // ID or size mismatch → Err
 cpl.keep_explicit_outputs_alive().await?;        // re-assert 0x66/1/108 after ≥ ¾ timeout idle
 if cpl.is_broken() { cpl.reconnect().await?; }   // Coupler<Client>: keeps layout + station,
                                                  // re-requests write access if it was enabled
+
+// class 1 (Coupler<Client>): sizes from one read of 111/112, checked against the station
+cpl.open_implicit(Duration::from_millis(20), ImplicitOptions::default()).await?;
+let img = cpl.next_implicit_inputs().await?;     // InputImage from the next T→O frame
+cpl.set_output(2, 8, Bit(true)).await?;          // goes into O→T, no request; likewise
+                                                 // set_outputs / write_slot_outputs / write_outputs
+cpl.set_implicit_run(true)?;                     // starts idle
+cpl.close_implicit().await?;                     // Forward_Close; outputs back to explicit
 ```
 
 Adding a module is one new file in `modules/` plus one identifier in the `register_modules!`
@@ -257,6 +278,8 @@ ur20eip [--addr IP[:PORT] | $UR20_EIP_ADDR] [--timeout-ms N] [--connected]
                                              read-modify-write one output channel
   set-many <slot:ch=value>… --modules … [--write-timeout 5s] [--no-enable]
                                              several channels, one read + one write
+  io [--rpi 20ms] [--set S:C=V]… [--run] [--duration 10s] [--local-port 2222] [--t-o-run-idle]
+                                             class 1 connection, print input changes
   diag [--slot N]… [--raw]                   status word, coupler and slot diagnosis
   raw get     <class> <instance> <attr>
   raw get-all <class> <instance>

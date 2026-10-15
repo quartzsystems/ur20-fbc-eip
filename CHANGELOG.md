@@ -44,6 +44,13 @@ All notable changes to this workspace are recorded here. The format follows
   `ImplicitOptions`, `ImplicitState`, `InputFrame`, `IoCounters`.
   `Client::forward_open_with` (extra CPF items), `ConnectionParams::timeout_for`,
   `Error::InvalidParams`.
+- Class 1 on the coupler (phase 3, M2; not yet tried on hardware):
+  `Coupler::open_implicit` (sized from the assemblies, checked against the station),
+  `implicit_inputs`, `next_implicit_inputs`, `set_implicit_run`, `close_implicit`,
+  `implicit()`. While it is open the output methods write into the O→T image, and explicit
+  output writes and `enable_explicit_outputs` fail with `Error::ImplicitOpen`.
+  `Error::ImplicitNotRunning`.
+- `ur20eip io [--rpi] [--set S:C=V] [--run] [--duration] [--local-port] [--t-o-run-idle]`.
 
 ### Changed
 
