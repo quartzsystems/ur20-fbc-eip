@@ -59,6 +59,8 @@ All notable changes to this workspace are recorded here. The format follows
   packets. Also verified: input changes over T→O, recovery from a cable pull, and that
   a module pull does not end the connection (a re-inserted module is driven at once).
 - `ur20eip io --reconnect`: reopen the class 1 connection (and TCP) whenever it ends.
+- Example `class1_di0_to_do0`: DO ch 0 follows DI ch 0 over class 1, idle while a module
+  is removed, reopens after connection loss, Forward_Close on Ctrl-C.
 
 ### Changed
 
