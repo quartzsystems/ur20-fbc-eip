@@ -20,8 +20,8 @@
 //!
 //! Layers, bottom up: [`encap`] (24-byte header, sessions) → [`cpf`] (Common Packet Format) →
 //! [`message`] (Message Router request/response, [`epath`]) → [`connection`]
-//! (Forward_Open/Close) → [`Client`] / [`CipService`]. [`io`] holds the types for class 1
-//! implicit I/O, which is not implemented yet.
+//! (Forward_Open/Close) → [`Client`] / [`CipService`]. Class 1 implicit I/O: [`io`] (packets)
+//! and [`implicit`] ([`ImplicitConnection`], one tokio task per connection).
 
 #![cfg_attr(
     test,
@@ -41,6 +41,7 @@ pub mod encap;
 pub mod epath;
 pub mod error;
 pub mod identity;
+pub mod implicit;
 pub mod io;
 pub mod message;
 pub mod service;
@@ -51,5 +52,6 @@ pub use connection::{ConnectionParams, ForwardOpenReply};
 pub use epath::{AttributePath, EPath, ObjectPath, Segment};
 pub use error::{Error, Result};
 pub use identity::{Identity, ListIdentityEntry};
+pub use implicit::{ImplicitConnection, ImplicitOptions, ImplicitState, InputFrame, IoCounters};
 pub use message::{CipStatus, MessageRequest, MessageResponse};
 pub use service::CipService;

@@ -8,7 +8,8 @@ bench bring-up.
 > station verification have run against a real UR20-FBC-EIP (read-only). Output writes and most
 > module codecs are tested against fixtures and mocks only. Items marked
 > **TODO-verify-on-hardware** in the code are still assumptions (see
-> [docs/DESIGN.md §7](docs/DESIGN.md)). Class 1 implicit I/O is planned.
+> [docs/DESIGN.md §7](docs/DESIGN.md)). Class 1 implicit I/O (`ImplicitConnection`) is
+> implemented in the CIP crate and tested against a mock adapter, not yet on hardware.
 
 ## FBC-EIP vs. FBC-MOD-TCP
 

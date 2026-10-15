@@ -139,7 +139,34 @@ path can contain configuration/consumed/produced connection points. `ForwardOpen
 any sockaddr CPF items. `io.rs` defines `RunIdleHeader` and `SequenceCount` types. Phase 3
 adds an `ImplicitConnection` that owns a UDP socket on 2222.
 
-Phase 3 design notes (not started; collected while doing phases 1–2):
+**Phase 3, M1 (implemented, mock-tested only):** `io::IoPacket` encodes and decodes class 1
+datagrams: a bare CPF packet with no encapsulation header, holding a sequenced address
+item, then connected data (sequence count, run/idle header O→T only, data).
+`ImplicitConnection` runs one connection:
+
+```rust
+let params = ConnectionParams::implicit_class1(1, 112, 111, out_len, in_len, rpi); // P2P T→O
+let io = ImplicitConnection::open(&mut client, params, ImplicitOptions::default()).await?;
+let mut inputs = io.inputs();          // watch::Receiver<Option<InputFrame>>
+io.set_outputs(&bytes)?;               // exact O→T data length
+io.set_run(true);                      // starts idle unless ImplicitOptions::run
+io.state();                            // WaitingForData → Running → TimedOut / Closed / Failed
+io.counters();                         // sent / received / stale / rejected
+io.close(&mut client).await?;          // stop task + Forward_Close; drop only stops the task
+```
+
+* It binds UDP before Forward_Open. On a port other than 2222 it sends a sockaddr T→O item
+  naming the port. O→T goes to the target IP, on the reply's O→T sockaddr port or 2222.
+* The task sends O→T every actual packet interval from the reply. It accepts T→O only from
+  the target IP with our T→O connection ID and the right size. Stale or duplicate sequence
+  counts are dropped but still reset the watchdog. With no valid T→O for RPI × 4 × 2^mult
+  (default multiplier 2, i.e. 16 × RPI) the state becomes `TimedOut` and the task ends.
+* Windows' `ConnectionReset` on `recv_from` (an ICMP "port unreachable" from an earlier send)
+  is ignored.
+* Both sequence numbers advance with every O→T packet.
+* A multicast T→O group from the reply is joined. That is not tried on hardware.
+
+Phase 3 design notes (collected while doing phases 1–2; M1 above follows them):
 
 * **Forward_Open for "Exclusive Owner Unpacked":** path `20 04 24 01 2C 70 2C 6F`
   (configuration instance 1, O→T point 112, T→O point 111; §7 item 4). O→T size = 112 length

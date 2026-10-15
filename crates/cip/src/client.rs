@@ -170,14 +170,20 @@ impl Client {
 
     /// Send a request as an unconnected message (UCMM, SendRRData).
     pub async fn send_unconnected(&mut self, request: &MessageRequest) -> Result<MessageResponse> {
-        let (response, _) = self.send_rr(request).await?;
+        let (response, _) = self.send_rr(request, &[]).await?;
         Ok(response)
     }
 
-    async fn send_rr(&mut self, request: &MessageRequest) -> Result<(MessageResponse, Vec<Item>)> {
+    async fn send_rr(
+        &mut self,
+        request: &MessageRequest,
+        extra: &[Item],
+    ) -> Result<(MessageResponse, Vec<Item>)> {
         let mr = request.encode()?;
         trace!(path = %request.path, service = request.service, req = %hex(&mr), "UCMM request");
-        let packet = cpf::encode(&[Item::NullAddress, Item::UnconnectedData(mr)])?;
+        let mut items = vec![Item::NullAddress, Item::UnconnectedData(mr)];
+        items.extend_from_slice(extra);
+        let packet = cpf::encode(&items)?;
         let timeout_s = u16::try_from(self.timeout.as_secs().max(1)).unwrap_or(u16::MAX);
         let reply = self
             .transact(command::SEND_RR_DATA, encap::send_data(timeout_s, &packet))
@@ -196,10 +202,21 @@ impl Client {
 
     /// Send Forward_Open with arbitrary parameters and return the parsed reply.
     ///
-    /// This does not change the client's mode; use [`Client::open_connected`] for class 3.
+    /// This does not change the client's mode; use [`Client::open_connected`] for class 3 and
+    /// [`crate::ImplicitConnection::open`] for class 1.
     pub async fn forward_open(&mut self, params: &ConnectionParams) -> Result<ForwardOpenReply> {
+        self.forward_open_with(params, &[]).await
+    }
+
+    /// [`Client::forward_open`] with extra CPF items after the request, e.g. a sockaddr
+    /// T→O item telling the target which UDP port to send class 1 data to.
+    pub async fn forward_open_with(
+        &mut self,
+        params: &ConnectionParams,
+        extra: &[Item],
+    ) -> Result<ForwardOpenReply> {
         let request = params.forward_open_request()?;
-        let (response, items) = self.send_rr(&request).await?;
+        let (response, items) = self.send_rr(&request, extra).await?;
         if !response.status.is_success() {
             return Err(Error::ForwardOpenRejected {
                 status: response.status,
@@ -226,13 +243,7 @@ impl Client {
         if self.connected.is_some() {
             self.close_connected().await?;
         }
-        let (serial, t_o_id) = triad_seed();
-        if params.connection_serial == 0 {
-            params.connection_serial = serial;
-        }
-        if params.t_o_connection_id == 0 {
-            params.t_o_connection_id = t_o_id;
-        }
+        fill_triad(&mut params);
         let reply = self.forward_open(&params).await?;
         let state = self.connected.insert(Connected {
             params,
@@ -408,6 +419,17 @@ async fn read_exact(stream: &mut TcpStream, buf: &mut [u8]) -> Result<()> {
         Ok(_) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Err(Error::Closed),
         Err(e) => Err(e.into()),
+    }
+}
+
+/// Give `params` a connection serial and T→O connection ID where they are 0.
+pub(crate) fn fill_triad(params: &mut ConnectionParams) {
+    let (serial, t_o_id) = triad_seed();
+    if params.connection_serial == 0 {
+        params.connection_serial = serial;
+    }
+    if params.t_o_connection_id == 0 {
+        params.t_o_connection_id = t_o_id;
     }
 }
 

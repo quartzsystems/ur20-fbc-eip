@@ -198,10 +198,13 @@ impl ConnectionParams {
         }
     }
 
-    /// Class 1 parameters for an exclusive-owner connection to assembly connection points.
+    /// Class 1 parameters for an exclusive-owner connection to assembly connection points,
+    /// for [`crate::ImplicitConnection::open`].
     ///
-    /// **Phase 3 hook, not exercised yet.** `o_t_bytes` / `t_o_bytes` are the assembly sizes;
-    /// the run/idle header and sequence count are added here.
+    /// `o_t_bytes` / `t_o_bytes` are the assembly sizes; the 2-byte sequence count (both
+    /// directions) and the 4-byte run/idle header (O→T) are added here. T→O is point to
+    /// point; set `t_o.connection_type` to [`ConnectionType::Multicast`] for multicast.
+    /// Timeout multiplier 2: the connection times out after 16 × RPI without data.
     pub fn implicit_class1(
         config_instance: u32,
         output_instance: u32,
@@ -218,13 +221,13 @@ impl ConnectionParams {
             size,
         };
         Self {
-            timeout_multiplier: 0,
+            timeout_multiplier: 2,
             o_t_rpi: rpi,
             // 2-byte sequence count + 4-byte run/idle header
             o_t: class1(o_t_bytes.saturating_add(6), ConnectionType::PointToPoint),
             t_o_rpi: rpi,
             // 2-byte sequence count; T→O has no run/idle header on most adapters
-            t_o: class1(t_o_bytes.saturating_add(2), ConnectionType::Multicast),
+            t_o: class1(t_o_bytes.saturating_add(2), ConnectionType::PointToPoint),
             transport: TransportType::CYCLIC_IO,
             path: EPath::new()
                 .with(Segment::Class(0x04))
@@ -233,6 +236,12 @@ impl ConnectionParams {
                 .with(Segment::ConnectionPoint(input_instance)),
             ..Self::explicit_class3()
         }
+    }
+
+    /// Connection timeout for data arriving at `rpi`: RPI × 4 × 2^multiplier.
+    pub fn timeout_for(&self, rpi: Duration) -> Duration {
+        let factor = 4u32.saturating_mul(1 << self.timeout_multiplier.min(7));
+        rpi.saturating_mul(factor)
     }
 
     fn rpi_us(d: Duration) -> u32 {
@@ -432,6 +441,21 @@ mod tests {
         assert_eq!(p.o_t.size, 16);
         assert_eq!(p.t_o.size, 14);
         assert_eq!(p.transport.to_byte(), 0x01);
+        assert_eq!(p.t_o.connection_type, ConnectionType::PointToPoint);
+        // fixed size, scheduled, point to point: 0x4800 | size
+        assert_eq!(p.t_o.to_word().ok(), Some(0x480E));
+        assert_eq!(
+            p.timeout_for(Duration::from_millis(10)),
+            Duration::from_millis(160)
+        );
+        let mut q = p.clone();
+        q.timeout_multiplier = 0;
+        assert_eq!(
+            q.timeout_for(Duration::from_millis(10)),
+            Duration::from_millis(40)
+        );
+        q.timeout_multiplier = 200; // clamped, no overflow
+        assert!(q.timeout_for(Duration::from_secs(1)) >= Duration::from_secs(512));
     }
 
     #[test]

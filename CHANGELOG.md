@@ -37,9 +37,18 @@ All notable changes to this workspace are recorded here. The format follows
   `explicit_outputs_timeout()`, `idle_time()`.
 - `ur20eip watch --reconnect` and `--write-access TIMEOUT` (reconnect verified on the
   bench by pulling the Ethernet cable).
+- Class 1 implicit I/O in `ur20-fbc-eip-cip` (phase 3, M1; not yet tried on hardware):
+  `io::IoPacket` (datagram encode/decode), `ImplicitConnection` (Forward_Open over a
+  `Client` session, one tokio task for cyclic O→T and T→O, watchdog timeout, inputs and
+  state as `watch` channels, packet counters, Forward_Close on `close`),
+  `ImplicitOptions`, `ImplicitState`, `InputFrame`, `IoCounters`.
+  `Client::forward_open_with` (extra CPF items), `ConnectionParams::timeout_for`,
+  `Error::InvalidParams`.
 
 ### Changed
 
+- `ConnectionParams::implicit_class1` now asks for point-to-point T→O (was multicast) and
+  timeout multiplier 2 (16 × RPI, was 4 × RPI).
 - `OutputImage` has a `trailer` field (bytes after the configured modules), which
   `write_outputs` writes back unchanged.
 - The `do_chase` example writes the whole DO module once per step.

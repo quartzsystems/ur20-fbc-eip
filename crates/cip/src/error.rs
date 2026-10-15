@@ -82,6 +82,11 @@ pub enum Error {
         status: CipStatus,
     },
 
+    /// Connection parameters that cannot work (e.g. a class 1 size too small for its
+    /// headers).
+    #[error("invalid connection parameters: {0}")]
+    InvalidParams(String),
+
     /// Connected messaging was requested but no connection is open.
     #[error("no connected (class 3) session is open")]
     NotConnected,
