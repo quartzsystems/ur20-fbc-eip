@@ -222,6 +222,11 @@ impl Coupler<Client> {
     /// Outputs start as zeros in idle mode (unless [`ImplicitOptions::run`]); set them with
     /// the usual output methods and switch to run with [`Coupler::set_implicit_run`].
     ///
+    /// Seen on a UR20-FBC-EIP with a UR20-16DO-P (2026-10-15): idle mode switches the
+    /// outputs off; a connection that stops (no Forward_Close) switches them off after its
+    /// timeout (16 × RPI); Forward_Close switches them off. In idle mode the module's output
+    /// data (0x65/n/114) keeps showing the last run values even though the outputs are off.
+    ///
     /// While the connection is open, output writes go into the next O→T packet instead of
     /// explicit messages: [`Coupler::set_output`], [`Coupler::set_outputs`],
     /// [`Coupler::write_slot_outputs`] and [`Coupler::write_outputs`] change the O→T image,
@@ -259,7 +264,7 @@ impl Coupler<Client> {
             size(in_len)?,
             rpi,
         );
-        // The coupler refuses explicit write access while class 1 owns the outputs.
+        // The coupler refuses explicit write access while class 1 owns the outputs (0x1F).
         self.explicit_timeout = None;
         let conn = ImplicitConnection::open(&mut self.service, params, options).await?;
         info!(?rpi, in_len, out_len, "class 1 connection open");
@@ -269,6 +274,15 @@ impl Coupler<Client> {
             conn,
         });
         Ok(())
+    }
+
+    /// Stop the class 1 task without Forward_Close, as a crashed program would: no more O→T
+    /// packets, and the coupler times the connection out on its side. Output methods go back
+    /// to explicit messaging. Prefer [`Coupler::close_implicit`].
+    pub fn drop_implicit(&mut self) {
+        if self.implicit.take().is_some() {
+            info!("class 1 connection dropped without Forward_Close");
+        }
     }
 
     /// Close the class 1 connection (Forward_Close), if one is open. Output methods go back
@@ -501,7 +515,7 @@ impl<S: CipService> Coupler<S> {
     pub async fn write_output_assembly(&mut self, data: &[u8]) -> Result<()> {
         if self.implicit.is_some() {
             return Err(Error::ImplicitOpen(
-                "explicit output writes would be ignored",
+                "the coupler rejects explicit output writes (0x0C)",
             ));
         }
         self.keep_explicit_outputs_alive().await?;
@@ -606,7 +620,7 @@ impl<S: CipService> Coupler<S> {
     pub async fn enable_explicit_outputs(&mut self, timeout: Duration) -> Result<()> {
         if self.implicit.is_some() {
             return Err(Error::ImplicitOpen(
-                "the coupler refuses explicit write access",
+                "the coupler refuses explicit write access (0x1F)",
             ));
         }
         let secs = timeout.as_secs() + u64::from(timeout.subsec_nanos() > 0);

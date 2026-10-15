@@ -151,7 +151,7 @@ let mut inputs = io.inputs();          // watch::Receiver<Option<InputFrame>>
 io.set_outputs(&bytes)?;               // exact O→T data length
 io.set_run(true);                      // starts idle unless ImplicitOptions::run
 io.state();                            // WaitingForData → Running → TimedOut / Closed / Failed
-io.counters();                         // sent / received / stale / rejected
+io.counters();                         // sent / received / unchanged / stale / rejected
 io.close(&mut client).await?;          // stop task + Forward_Close; drop only stops the task
 ```
 
@@ -193,17 +193,16 @@ Phase 3 design notes (collected while doing phases 1–2; M1 and M2 follow them)
   `ImplicitConnection` should hand out raw bytes plus sequence count and let the caller pick
   the codec layer, which keeps `cip` free of u-remote knowledge.
 * **Explicit and implicit are exclusive for outputs:** while an Exclusive Owner connection
-  is up, `enable_explicit_outputs` is refused and explicit writes to 112 are ignored (as
-  without access). The coupler type should refuse explicit output writes while it owns a
-  class 1 connection and route writes into the next O→T packet instead, rather than
-  relying on the device.
-* **Fail-safe analogy:** with explicit access the outputs drop to 0 on a lapse. Expect the
-  same on a class 1 timeout (RPI × multiplier) or in idle mode (run/idle bit 0). Verify both
-  with 0x65/n/114 and the LED on DO channel 8 before relying on them.
-* **Things to verify on the bench:** whether the web server's "EIPNoConnection" clears with
-  a class 1 connection up (cheap liveness check); whether 0x64/1/104 keeps mirroring the
-  status word; behaviour on module pull with a connection up (the size changes, so the
-  coupler may close the connection).
+  is up, the coupler refuses explicit write access (0x66/1/108, status 0x1F) and rejects
+  explicit writes to 112 (0x0C, object state conflict), unlike the silent ignore without
+  access (§7, 2026-10-15). The coupler type refuses both locally and routes writes into
+  the next O→T packet.
+* **Fail-safe:** confirmed with the LED on DO channel 8 (§7): idle mode, a connection
+  timeout and Forward_Close all switch the outputs off. Under class 1 idle, 0x65/n/114 is
+  **not** the physical output (it keeps the last run values).
+* **Still to verify on the bench:** behaviour on module pull with a connection up (the
+  size changes, so the coupler may close the connection); a cable pull with a connection up;
+  input changes over T→O (needs 24 V on a DI); multicast T→O.
 * **Runtime shape:** one tokio task per connection that owns the UDP socket and a
   `tokio::time::interval(rpi)` for O→T, sharing the latest T→O image through a
   `tokio::sync::watch` channel and taking outputs through a `watch` or `mpsc`. Close with
@@ -329,6 +328,28 @@ Answered with the DI/DO write test and raw probes (2026-10-14, 2 s explicit-writ
   next re-assert.
 * ✔ Read-only hardware tests (identity unconnected/connected, assemblies and slots,
   configured station, diagnosis) all pass against the bench station.
+
+Class 1 implicit I/O (2026-10-15, `ur20eip io`, the `class1_check` example and the
+`class1_*` hardware tests; LED on DO channel 8):
+
+* ✔ **Forward_Open "Exclusive Owner Unpacked" accepted** with point-to-point T→O: path
+  `20 04 24 01 2C 70 2C 6F`, O→T 4 + 6 bytes, T→O 4 + 2 bytes (no run/idle header). The reply
+  carried an O→T sockaddr `0.0.0.0:2222` and no T→O sockaddr. Actual intervals equal the
+  RPI. **RPI 1 ms, 2 ms, 5 ms, 10 ms, 20 ms all accepted**, and 1 ms ran for 3 s from this
+  Windows PC without a timeout.
+* ✔ The web server's "EIPNoConnection" clears while the connection is up. The status word
+  stays `0x0000` and 0x66/1/108 stays 0.
+* ✔ **T→O sequence count:** the coupler repeats the same count while its data is unchanged
+  (1 new frame, then only repeats over 10 s), so "unchanged" packets are the normal
+  heartbeat, counted apart from out-of-order ones.
+* ✔ **Run/idle:** idle (from the start) → LED off, 114 `00 00`. Run → LED on, 114 `00 01`.
+  Idle again → **LED off, but 114 stays `00 01`**. So under class 1, 114 is the last data
+  applied in run mode, not the physical output.
+* ✔ **Explicit writes while class 1 owns the outputs:** 0x66/1/108 := 1 → 0x1F; 0x04/112/3
+  := zeros → **0x0C** (object state conflict), 114 unchanged.
+* ✔ **Fail-safe:** O→T stopped without Forward_Close → 114 `00 00` and LED off 0.32 s later
+  (timeout 16 × 20 ms). Forward_Close → off within 0.16 s. Re-opening right after a
+  timed-out connection works.
 
 Still open:
 

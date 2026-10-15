@@ -15,8 +15,9 @@
 //! O→T data carries the 32-bit run/idle header; T→O data normally does not (the
 //! connection's "real-time format" decides). [`crate::implicit`] runs the sockets.
 //!
-//! TODO-verify-on-hardware: the byte layout follows the CIP specification and has not yet
-//! been captured from a UR20-FBC-EIP.
+//! The layout follows the CIP specification. A UR20-FBC-EIP (firmware 01.21.00) accepted
+//! O→T packets in exactly this form and its T→O packets decoded with `run_idle = false`
+//! (2026-10-15, DO channel 8 switched as sent). No Wireshark capture yet.
 
 use crate::codec::{Reader, WriteLe};
 use crate::cpf::{self, Item};
@@ -145,7 +146,7 @@ mod tests {
         assert!(!RunIdleHeader::IDLE.is_run());
     }
 
-    // TODO-verify-on-hardware: built from CIP Vol. 2 3-2.2, not captured.
+    // Built from CIP Vol. 2 3-2.2; a UR20-FBC-EIP applied packets of this form (2026-10-15).
     #[rustfmt::skip]
     const O_T: [u8; 32] = [
         0x02, 0x00,                         // 2 items

@@ -403,7 +403,9 @@ async fn foreign_wrong_and_stale_packets_are_dropped() {
     .unwrap(); // older
     eventually("counted", || {
         let c = io.counters();
-        c.rejected == before.rejected + 3 && c.stale == before.stale + 2
+        c.rejected == before.rejected + 3
+            && c.unchanged == before.unchanged + 1
+            && c.stale == before.stale + 1
     })
     .await;
     assert_eq!(

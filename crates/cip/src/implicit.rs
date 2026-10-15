@@ -115,9 +115,13 @@ pub struct InputFrame {
 pub struct IoCounters {
     /// O→T packets sent.
     pub sent: u64,
-    /// T→O packets accepted.
+    /// T→O packets with new data (sequence count advanced), published as inputs.
     pub received: u64,
-    /// T→O packets dropped as old or duplicate (sequence count not newer).
+    /// T→O packets repeating the last sequence count: the producer's heartbeat while its
+    /// data is unchanged (the UR20-FBC-EIP does this, 2026-10-15). They keep the connection
+    /// alive but publish nothing.
+    pub unchanged: u64,
+    /// T→O packets with an older sequence count (out of order), dropped.
     pub stale: u64,
     /// Datagrams dropped as foreign, malformed, for another connection, or of the wrong size.
     pub rejected: u64,
@@ -127,6 +131,7 @@ pub struct IoCounters {
 struct Counters {
     sent: AtomicU64,
     received: AtomicU64,
+    unchanged: AtomicU64,
     stale: AtomicU64,
     rejected: AtomicU64,
 }
@@ -140,6 +145,7 @@ impl Counters {
         IoCounters {
             sent: self.sent.load(Ordering::Relaxed),
             received: self.received.load(Ordering::Relaxed),
+            unchanged: self.unchanged.load(Ordering::Relaxed),
             stale: self.stale.load(Ordering::Relaxed),
             rejected: self.rejected.load(Ordering::Relaxed),
         }
@@ -511,6 +517,10 @@ impl Task {
         if !size_ok {
             Counters::bump(&self.counters.rejected);
             return false;
+        }
+        if *last_in == Some(packet.sequence) {
+            Counters::bump(&self.counters.unchanged);
+            return true;
         }
         if last_in.is_some_and(|last| !last.is_newer(packet.sequence)) {
             Counters::bump(&self.counters.stale);

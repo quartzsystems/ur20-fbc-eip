@@ -51,6 +51,12 @@ All notable changes to this workspace are recorded here. The format follows
   output writes and `enable_explicit_outputs` fail with `Error::ImplicitOpen`.
   `Error::ImplicitNotRunning`.
 - `ur20eip io [--rpi] [--set S:C=V] [--run] [--duration] [--local-port] [--t-o-run-idle]`.
+- Class 1 verified on the bench (phase 3, M3): Forward_Open accepted at RPI 1–20 ms, inputs
+  decoded, run and idle mode, fail-safe on timeout and on Forward_Close, explicit writes
+  refused while class 1 owns the outputs. Example `class1_check`, hardware tests
+  `class1_idle_connection` and `class1_writes_outputs`. `Coupler::drop_implicit`.
+  `IoCounters::unchanged` counts the coupler's heartbeat repeats separately from stale
+  packets.
 
 ### Changed
 

@@ -226,3 +226,117 @@ async fn diagnosis() {
         "0x64/1/104 mirrors the 111 header"
     );
 }
+
+/// Class 1 in idle mode: nothing is applied to the outputs.
+#[tokio::test]
+#[ignore = "needs hardware: set UR20_EIP_ADDR"]
+async fn class1_idle_connection() {
+    use std::time::Duration;
+    use ur20_fbc_eip::cip::{ImplicitOptions, ImplicitState};
+
+    let mut c = Coupler::connect_auto(addr(), CouplerLayout::default())
+        .await
+        .unwrap();
+    c.open_implicit(Duration::from_millis(20), ImplicitOptions::default())
+        .await
+        .unwrap();
+    let img = c.next_implicit_inputs().await.unwrap();
+    println!("class 1 inputs: {img:?}");
+    // the T→O frame and an explicit read agree (both 2 header bytes + module data)
+    assert_eq!(img.status_word, c.read_inputs().await.unwrap().status_word);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let io = c.implicit().unwrap();
+    println!("{:?} {:?}", io.current_state(), io.counters());
+    assert_eq!(io.current_state(), ImplicitState::Running);
+    let n = io.counters();
+    assert!(n.sent >= 20 && n.received + n.unchanged >= 20, "{n:?}");
+    assert_eq!(n.rejected, 0);
+    c.close().await.unwrap();
+}
+
+/// Class 1 driving DO channel 0. Needs `UR20_EIP_ALLOW_WRITES=1`. Checks the behaviour seen
+/// on 2026-10-15: run applies (0x65/n/114 follows), idle switches the physical outputs off
+/// but leaves 114 at the last run value, explicit output writes are refused (0x0C), and both
+/// a dropped connection and Forward_Close switch the outputs off.
+#[tokio::test]
+#[ignore = "needs hardware and UR20_EIP_ALLOW_WRITES=1: switches outputs"]
+async fn class1_writes_outputs() {
+    use std::time::Duration;
+    use ur20_fbc_eip::cip::{AttributePath, CipService, ImplicitOptions};
+    use ur20_fbc_eip::{Category, ChannelValue::Bit};
+
+    if std::env::var("UR20_EIP_ALLOW_WRITES").as_deref() != Ok("1") {
+        println!("skipped: set UR20_EIP_ALLOW_WRITES=1 to switch real outputs");
+        return;
+    }
+    let rpi = Duration::from_millis(20);
+    let mut c = Coupler::connect_auto(addr(), CouplerLayout::default())
+        .await
+        .unwrap();
+    let slot = c
+        .station()
+        .slots()
+        .iter()
+        .find(|s| s.module.descriptor().category == Category::DigitalOutput)
+        .map(|s| s.position)
+        .expect("a digital output module");
+    let settle = Duration::from_millis(200);
+
+    c.open_implicit(rpi, ImplicitOptions::default())
+        .await
+        .unwrap();
+    c.set_output(slot, 0, Bit(true)).await.unwrap();
+    tokio::time::sleep(settle).await;
+    let idle_before_run = driven(&mut c, slot).await;
+    c.set_implicit_run(true).unwrap();
+    tokio::time::sleep(settle).await;
+    let run = driven(&mut c, slot).await;
+    let refused = c
+        .service_mut()
+        .set_attribute_single(AttributePath::new(0x04, 112, 3), &[0; 4])
+        .await
+        .unwrap_err();
+    c.set_implicit_run(false).unwrap();
+    tokio::time::sleep(settle).await;
+    let idle_after_run = driven(&mut c, slot).await;
+    println!(
+        "114: idle {} / run {} / idle again {}; explicit 112 write: {refused}",
+        hex(&idle_before_run),
+        hex(&run),
+        hex(&idle_after_run)
+    );
+    assert!(
+        idle_before_run.iter().all(|b| *b == 0),
+        "idle never applies"
+    );
+    assert_eq!(run.first().map(|b| b & 1), Some(1), "run applies");
+    assert_eq!(idle_after_run, run, "idle leaves 114 at the last run value");
+    assert_eq!(refused.cip_status().map(|s| s.general), Some(0x0C));
+
+    // dropped without Forward_Close: off after the connection timeout (16 × RPI)
+    c.set_implicit_run(true).unwrap();
+    tokio::time::sleep(settle).await;
+    c.drop_implicit();
+    tokio::time::sleep(rpi * 16 + settle).await;
+    assert!(
+        driven(&mut c, slot).await.iter().all(|b| *b == 0),
+        "off after timeout"
+    );
+
+    // clean Forward_Close: off too
+    let run_now = ImplicitOptions {
+        run: true,
+        ..ImplicitOptions::default()
+    };
+    c.open_implicit(rpi, run_now).await.unwrap();
+    c.set_output(slot, 0, Bit(true)).await.unwrap();
+    tokio::time::sleep(settle).await;
+    assert_eq!(driven(&mut c, slot).await.first().map(|b| b & 1), Some(1));
+    c.close_implicit().await.unwrap();
+    tokio::time::sleep(settle).await;
+    assert!(
+        driven(&mut c, slot).await.iter().all(|b| *b == 0),
+        "off after Forward_Close"
+    );
+    c.close().await.unwrap();
+}
