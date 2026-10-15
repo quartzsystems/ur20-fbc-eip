@@ -293,6 +293,7 @@ mod tests {
                 "5s",
             ],
             &["io", "--local-port", "0", "--t-o-run-idle"],
+            &["io", "--reconnect", "--set", "2:8=on", "--run"],
             &["set", "2", "8", "on", "--write-timeout", "5s"],
             &["set-many", "2:0=on", "2:15=off", "--no-enable"],
             &["raw", "get", "0x04", "111", "3"],

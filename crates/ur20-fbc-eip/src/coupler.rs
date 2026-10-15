@@ -226,6 +226,9 @@ impl Coupler<Client> {
     /// outputs off; a connection that stops (no Forward_Close) switches them off after its
     /// timeout (16 × RPI); Forward_Close switches them off. In idle mode the module's output
     /// data (0x65/n/114) keeps showing the last run values even though the outputs are off.
+    /// Pulling a module does not end the connection (the status word in each input frame
+    /// shows [`StatusWord::MODULE_REMOVED`]), and a module inserted while the connection
+    /// runs is driven with the current outputs at once.
     ///
     /// While the connection is open, output writes go into the next O→T packet instead of
     /// explicit messages: [`Coupler::set_output`], [`Coupler::set_outputs`],

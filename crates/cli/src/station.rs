@@ -341,25 +341,91 @@ pub struct IoArgs {
     /// T→O data starts with a run/idle header (try if inputs look shifted by 4 bytes).
     #[arg(long)]
     pub t_o_run_idle: bool,
+
+    /// When the connection ends (timeout, cable or module pulled), keep reopening it,
+    /// reconnecting TCP first if needed.
+    #[arg(long)]
+    pub reconnect: bool,
 }
 
-/// `ur20eip io`: class 1 connection, print input changes, optionally drive outputs.
+/// `ur20eip io`: class 1 connection, print input changes, optionally drive outputs, and with
+/// `--reconnect` reopen it whenever it ends.
 pub async fn io(coupler: &mut Coupler<Client>, args: &IoArgs) -> Result<()> {
     let changes = typed_changes(coupler, &args.set)?;
+    let start = tokio::time::Instant::now();
+    let t = || start.elapsed().as_secs_f64();
+    let stop = async {
+        match args.duration {
+            Some(d) => tokio::time::sleep(d).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(stop);
+    let mut printer = Changes::default();
+    let mut delay = Duration::from_millis(500);
+    loop {
+        let opened = tokio::select! {
+            r = open_class1(coupler, args, &changes) => r,
+            _ = &mut stop => return finish(coupler).await,
+            _ = tokio::signal::ctrl_c() => return finish(coupler).await,
+        };
+        if let Err(e) = opened {
+            coupler.drop_implicit();
+            if !args.reconnect {
+                return Err(e.context(
+                    "opening the class 1 connection (a PLC connected? wrong module list?)",
+                ));
+            }
+            println!("{:>9.3}s open failed: {e:#}; retrying in {delay:?}", t());
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = &mut stop => return finish(coupler).await,
+                _ = tokio::signal::ctrl_c() => return finish(coupler).await,
+            }
+            delay = (delay * 2).min(Duration::from_secs(5));
+            continue;
+        }
+        delay = Duration::from_millis(500);
+        let ended = loop {
+            tokio::select! {
+                r = coupler.next_implicit_inputs() => match r {
+                    Ok(img) => printer.print(t(), img),
+                    Err(e) => break e,
+                },
+                _ = &mut stop => return finish(coupler).await,
+                _ = tokio::signal::ctrl_c() => return finish(coupler).await,
+            }
+        };
+        let counters = coupler.implicit().map(|io| io.counters());
+        println!("{:>9.3}s class 1 ended: {ended}; {counters:?}", t());
+        coupler.drop_implicit();
+        if !args.reconnect {
+            return Err(ended.into());
+        }
+    }
+}
+
+/// Open the class 1 connection (reconnecting TCP first if it broke), then apply `--set` and
+/// the mode.
+async fn open_class1(
+    coupler: &mut Coupler<Client>,
+    args: &IoArgs,
+    changes: &[(usize, usize, ChannelValue)],
+) -> Result<()> {
+    if coupler.is_broken() {
+        coupler.reconnect().await.context("reconnecting TCP")?;
+        println!("TCP session reconnected");
+    }
     let options = ImplicitOptions {
         local_port: args.local_port,
         t_o_run_idle: args.t_o_run_idle,
         run: false,
     };
-    coupler
-        .open_implicit(args.rpi, options)
-        .await
-        .context("opening the class 1 connection (a PLC connected? wrong module list?)")?;
+    coupler.open_implicit(args.rpi, options).await?;
     if let Some(io) = coupler.implicit() {
         let r = io.reply();
         println!(
-            "class 1 open: RPI {:?}, actual O→T {:?} / T→O {:?}, timeout {:?}, {} → {}, \
-             {}/{} bytes out/in",
+            "class 1 open: RPI {:?}, actual O→T {:?} / T→O {:?}, timeout {:?}, {} → {}, {}/{} bytes out/in",
             args.rpi,
             r.o_t_api,
             r.t_o_api,
@@ -370,21 +436,6 @@ pub async fn io(coupler: &mut Coupler<Client>, args: &IoArgs) -> Result<()> {
             io.input_len()
         );
     }
-    let result = io_loop(coupler, args, &changes).await;
-    if let Some(io) = coupler.implicit() {
-        println!("state {:?}, {:?}", io.current_state(), io.counters());
-    }
-    if let Err(e) = coupler.close_implicit().await {
-        println!("Forward_Close: {e}");
-    }
-    result
-}
-
-async fn io_loop(
-    coupler: &mut Coupler<Client>,
-    args: &IoArgs,
-    changes: &[(usize, usize, ChannelValue)],
-) -> Result<()> {
     coupler.set_outputs(changes).await?;
     for (slot, channel, value) in changes {
         println!("O→T slot {slot} channel {channel} = {value}");
@@ -398,26 +449,18 @@ async fn io_loop(
             "idle (outputs not applied)"
         }
     );
+    Ok(())
+}
 
-    let start = tokio::time::Instant::now();
-    let stop = async {
-        match args.duration {
-            Some(d) => tokio::time::sleep(d).await,
-            None => std::future::pending().await,
-        }
-    };
-    tokio::pin!(stop);
-    let mut printer = Changes::default();
-    loop {
-        tokio::select! {
-            r = coupler.next_implicit_inputs() => {
-                let img = r?;
-                printer.print(start.elapsed().as_secs_f64(), img);
-            }
-            _ = &mut stop => return Ok(()),
-            _ = tokio::signal::ctrl_c() => return Ok(()),
-        }
+/// Print the final state and counters, then Forward_Close.
+async fn finish(coupler: &mut Coupler<Client>) -> Result<()> {
+    if let Some(io) = coupler.implicit() {
+        println!("state {:?}, {:?}", io.current_state(), io.counters());
     }
+    if let Err(e) = coupler.close_implicit().await {
+        println!("Forward_Close: {e}");
+    }
+    Ok(())
 }
 
 /// Options for commands that write outputs.

@@ -200,9 +200,8 @@ Phase 3 design notes (collected while doing phases 1–2; M1 and M2 follow them)
 * **Fail-safe:** confirmed with the LED on DO channel 8 (§7): idle mode, a connection
   timeout and Forward_Close all switch the outputs off. Under class 1 idle, 0x65/n/114 is
   **not** the physical output (it keeps the last run values).
-* **Still to verify on the bench:** behaviour on module pull with a connection up (the
-  size changes, so the coupler may close the connection); a cable pull with a connection up;
-  input changes over T→O (needs 24 V on a DI); multicast T→O.
+* **Still to verify on the bench:** multicast T→O. Module pull, cable pull and input
+  changes were verified on 2026-10-15 (§7).
 * **Runtime shape:** one tokio task per connection that owns the UDP socket and a
   `tokio::time::interval(rpi)` for O→T, sharing the latest T→O image through a
   `tokio::sync::watch` channel and taking outputs through a `watch` or `mpsc`. Close with
@@ -277,7 +276,8 @@ ur20eip [--addr IP[:PORT] | $UR20_EIP_ADDR] [--timeout-ms N] [--connected]
                                              read-modify-write one output channel
   set-many <slot:ch=value>… --modules … [--write-timeout 5s] [--no-enable]
                                              several channels, one read + one write
-  io [--rpi 20ms] [--set S:C=V]… [--run] [--duration 10s] [--local-port 2222] [--t-o-run-idle]
+  io [--rpi 20ms] [--set S:C=V]… [--run] [--duration 10s] [--reconnect] [--local-port 2222]
+     [--t-o-run-idle]
                                              class 1 connection, print input changes
   diag [--slot N]… [--raw]                   status word, coupler and slot diagnosis
   raw get     <class> <instance> <attr>
@@ -350,13 +350,29 @@ Class 1 implicit I/O (2026-10-15, `ur20eip io`, the `class1_check` example and t
 * ✔ **Fail-safe:** O→T stopped without Forward_Close → 114 `00 00` and LED off 0.32 s later
   (timeout 16 × 20 ms). Forward_Close → off within 0.16 s. Re-opening right after a
   timed-out connection works.
+* ✔ **Input changes over T→O:** 24 V pulses on DI ch 0, some only 80–140 ms long, each
+  showed up as a new frame (sequence count advanced), on both edges.
+* ✔ **Cable pull** (`ur20eip io --reconnect --set 2:8=on --run`): the connection timed out
+  0.3 s after the pull, and the LED went off. The first reopen ran Forward_Open on the dead
+  TCP session and hit the 3 s request timeout, which marks the client broken. TCP reconnects
+  then retried with backoff (0.5 → 4 s) until the cable was back. After that came a new
+  session, a new class 1 connection, and ch 8 on again with no help.
+* ✔ **Module pull with class 1 up:** the coupler does **not** end the connection. T→O and
+  O→T continue, and the DI module's inputs keep arriving. The status word in each T→O frame
+  shows `0x0040`. When the DO module goes back in, it **picks up the current O→T outputs on
+  its own** (LED on again, no reopen). So with class 1, a module inserted into a running
+  connection is driven immediately.
+* Status word during that pull: `0x0040` (out) → `0x0000` (insertion that did not seat) →
+  `0x0040` (pulled again) → **`0x0048` for 0.8 s** → `0x0040` → `0x0000` (final
+  insertion). Bit 3 appeared only during the final, successful insertion; unnamed, see 8.
 
 Still open:
 
 7. Analog byte order and 2CNT-100 layout: need those modules on the station.
-8. Status word bits other than 6 and 13; the rest of the module diagnosis; 0x64/1/118,
-   which no fault has set so far (candidates: a short circuit on a DO, a wire break on a
-   DIAG module, a parameter error).
+8. Status word bits other than 6 and 13 (bit 3 was set for 0.8 s while a module was being
+   inserted; one observation, so it has no name yet); the rest of the module diagnosis;
+   0x64/1/118, which no fault has set so far (candidates: a short circuit on a DO, a wire
+   break on a DIAG module, a parameter error).
 
 Answered on the bench (2026-10-14, LED on DO channel 8, raw `ur20eip` calls, 2 s timeout):
 

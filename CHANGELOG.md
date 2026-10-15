@@ -56,7 +56,9 @@ All notable changes to this workspace are recorded here. The format follows
   refused while class 1 owns the outputs. Example `class1_check`, hardware tests
   `class1_idle_connection` and `class1_writes_outputs`. `Coupler::drop_implicit`.
   `IoCounters::unchanged` counts the coupler's heartbeat repeats separately from stale
-  packets.
+  packets. Also verified: input changes over T→O, recovery from a cable pull, and that
+  a module pull does not end the connection (a re-inserted module is driven at once).
+- `ur20eip io --reconnect`: reopen the class 1 connection (and TCP) whenever it ends.
 
 ### Changed
 

@@ -83,6 +83,8 @@ impl StatusWord {
     /// Bit 13: set while the Uout field supply was disconnected; the web server showed
     /// "Output power supply error" (2026-10-14).
     pub const OUTPUT_SUPPLY_ERROR: u16 = 1 << 13;
+    // Bit 3 was set for about 0.8 s while a pulled module was being re-inserted
+    // (2026-10-15, once). TODO-verify-on-hardware before naming it.
 
     const NAMED: [(u16, &'static str); 2] = [
         (Self::MODULE_REMOVED, "module removed"),
