@@ -269,8 +269,7 @@ Answered with the DI/DO write test and raw probes (2026-10-14, 2 s explicit-writ
   the QSG, that such writes are rejected; the mock coupler now models this.)
 * ✔ **Lapse is fail-safe but 112 is stale.** 2 s timeout, DO ch 8 on, 4 s idle: 108 → 0,
   0x65/2/114 → `00 00`, 112 still `00 00 00 01`. Setting 108 = 1 again does not re-apply
-  112; the next write does. This was seen via 0x65/2/114. The LED on DO channel 8 was not
-  watched for this one.
+  112; the next write does. Confirmed with the LED on DO channel 8 (see below).
 * ✔ Access is not tied to the session: enabling it in one TCP session (one `ur20eip raw set`
   call) and writing from another drove the module.
 * ✔ Keepalive: writes more than the timeout apart (2.5 s with a 2 s timeout) are all
@@ -287,10 +286,19 @@ Still open:
 8. Status word bits other than 6 and 13; the rest of the module diagnosis; 0x64/1/118,
    which no fault has set so far (candidates: a short circuit on a DO, a wire break on a
    DIAG module, a parameter error).
-9. Confirm with the DO channel 8 LED that a write without access, and a lapse, really leave
-   the physical output off (so far seen only via 0x65/2/114).
-10. `Coupler::reconnect` against the real coupler (pull the Ethernet cable during
-    `ur20eip watch --reconnect`); tested only against the mock adapter so far.
+
+Answered on the bench (2026-10-14, LED on DO channel 8, raw `ur20eip` calls, 2 s timeout):
+
+* ✔ **0x65/n/114 is the physical output.** The LED matched 114 in every phase: write ch 8
+  without access → 112 `00 00 00 01`, 114 `00 00`, LED off. Access on + write → 114 `00 01`,
+  LED on. Traffic stopped → LED off about 2 s later, 108 `00`, 114 `00 00`, 112 still
+  `00 00 00 01`. 108 set again without a write → LED stays off. Write off + access off →
+  off.
+* ✔ **Reconnect on real hardware.** `ur20eip watch -i 500ms --reconnect --write-access 2s`,
+  Ethernet cable pulled for about 25 s: "connection lost: no reply within 3s" at 12.0 s,
+  "reconnected" at 36.5 s (retry delay 0.5 → 5 s). Afterwards 0x66/1/108 = 01 and 107 = 2 s,
+  still 01 after 4 s with no other client talking, so the reconnected session holds write
+  access by itself. `diag` clean (status word 0x0000, both slots ok).
 
 Answered with signals on the bench (2026-10-13):
 

@@ -35,7 +35,8 @@ All notable changes to this workspace are recorded here. The format follows
   0x66/1/107+108 before output writes after ≥ ¾ of the timeout idle.
   `Coupler::keep_explicit_outputs_alive()`, `disable_explicit_outputs()`,
   `explicit_outputs_timeout()`, `idle_time()`.
-- `ur20eip watch --reconnect` and `--write-access TIMEOUT`.
+- `ur20eip watch --reconnect` and `--write-access TIMEOUT` (reconnect verified on the
+  bench by pulling the Ethernet cable).
 
 ### Changed
 
