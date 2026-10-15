@@ -8,12 +8,12 @@
 //!
 //! [`Coupler::write_slot_outputs`]: ur20_fbc_eip::Coupler::write_slot_outputs
 //!
-//! Station: slot 2 = UR20-16DO-P (or another 16-channel digital output module). Coupler
-//! address from `UR20_EIP_ADDR`; module list from `UR20_EIP_MODULES` or, if unset, read
-//! from the coupler.
+//! Station: slot 2 = UR20-16DO-P (or another 16-channel digital output module). Coupler at
+//! 10.42.30.101 unless `UR20_EIP_ADDR` says otherwise; module list from `UR20_EIP_MODULES` or,
+//! if unset, read from the coupler.
 //!
 //! ```sh
-//! UR20_EIP_ADDR=192.168.1.10 cargo run -p ur20-fbc-eip --example do_chase
+//! cargo run -p ur20-fbc-eip --example do_chase
 //! ```
 
 use std::time::Duration;

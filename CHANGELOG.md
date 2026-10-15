@@ -69,6 +69,9 @@ All notable changes to this workspace are recorded here. The format follows
 - `OutputImage` has a `trailer` field (bytes after the configured modules), which
   `write_outputs` writes back unchanged.
 - The `do_chase` example writes the whole DO module once per step.
+- Examples use channel 0 (`di8_to_do8` / `di8_blink_do8` are now `di0_to_do0` /
+  `di0_blink_do0`, with slot and channel constants; `class1_check` drives DO ch 0) and
+  connect to the bench coupler 10.42.30.101 unless `UR20_EIP_ADDR` is set.
 - The examples read the coupler address from `UR20_EIP_ADDR` and the module list from
   `UR20_EIP_MODULES`, or detect the modules from the coupler, the same way the CLI does.
 

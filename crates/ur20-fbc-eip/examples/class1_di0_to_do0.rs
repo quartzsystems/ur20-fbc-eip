@@ -16,11 +16,12 @@
 //! * Ctrl-C closes it with Forward_Close, which switches the outputs off.
 //!
 //! Station: slot 1 = UR20-16DI-P, slot 2 = UR20-16DO-P (or any digital modules in those
-//! slots). Channels count from 0; change the constants below to use others. Coupler address from
-//! `UR20_EIP_ADDR`; module list from `UR20_EIP_MODULES` or, if unset, read from the coupler.
+//! slots). Channels count from 0; change the constants below to use others. Coupler at
+//! 10.42.30.101 unless `UR20_EIP_ADDR` says otherwise; module list from `UR20_EIP_MODULES` or,
+//! if unset, read from the coupler.
 //!
 //! ```sh
-//! UR20_EIP_ADDR=192.168.1.10 cargo run -p ur20-fbc-eip --example class1_di0_to_do0
+//! cargo run -p ur20-fbc-eip --example class1_di0_to_do0
 //! ```
 
 use std::time::Duration;

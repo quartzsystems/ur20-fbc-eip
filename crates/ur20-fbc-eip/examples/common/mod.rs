@@ -4,7 +4,8 @@
 
 //! Setup shared by the examples, configured from the environment like `ur20eip`:
 //!
-//! * `UR20_EIP_ADDR`: coupler IP or IP:PORT (port 44818 if omitted). Required.
+//! * `UR20_EIP_ADDR`: coupler IP or IP:PORT (port 44818 if omitted). Default
+//!   [`DEFAULT_ADDR`], the bench coupler.
 //! * `UR20_EIP_MODULES`: modules in slot order, comma separated, checked against the coupler.
 //!   If unset, the module list is read from the coupler ([`Coupler::connect_auto`]).
 
@@ -13,13 +14,15 @@ use std::net::{IpAddr, SocketAddr};
 use ur20_fbc_eip::cip::encap::DEFAULT_PORT;
 use ur20_fbc_eip::{Category, Coupler, CouplerLayout, modules};
 
+/// Coupler used when `UR20_EIP_ADDR` is not set.
+pub const DEFAULT_ADDR: &str = "10.42.30.101";
+
 /// Examples report any error and exit.
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-/// `UR20_EIP_ADDR` as a socket address.
+/// `UR20_EIP_ADDR` (or [`DEFAULT_ADDR`]) as a socket address.
 pub fn addr() -> Result<SocketAddr> {
-    let s = std::env::var("UR20_EIP_ADDR")
-        .map_err(|_| "set UR20_EIP_ADDR to the coupler IP or IP:PORT")?;
+    let s = std::env::var("UR20_EIP_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_owned());
     let s = s.trim();
     s.parse::<SocketAddr>()
         .or_else(|_| {
